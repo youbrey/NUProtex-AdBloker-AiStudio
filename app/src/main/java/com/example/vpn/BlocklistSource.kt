@@ -54,16 +54,31 @@ object BlocklistSource {
         "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-only/hosts"
     private const val URLHAUS_HOSTFILE =
         "https://urlhaus.abuse.ch/downloads/hostfile/"
+    private const val ADAWAY_OFFICIAL =
+        "https://adaway.org/hosts.txt"
+    private const val DAN_POLLOCK_HOSTS =
+        "https://someonewhocares.org/hosts/hosts"
+    private const val DISCONNECT_TRACKING =
+        "https://s3.amazonaws.com/lists.disconnect.me/simple_tracking.txt"
+    private const val DISCONNECT_AD =
+        "https://s3.amazonaws.com/lists.disconnect.me/simple_ad.txt"
+    private const val PHISHING_DATABASE =
+        "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/phishing-domains_ACTIVE.txt"
 
     /** Semua sumber yang perlu diunduh. Satu kategori bisa punya >1 sumber (digabung saat load). */
     val ALL_SOURCES: List<Source> = listOf(
-        Source("game_ads", STEVENBLACK_BASE, "stevenblack_base"),
-        Source("marketplace_ads", STEVENBLACK_BASE, "stevenblack_base"),
-        Source("trackers", STEVENBLACK_BASE, "stevenblack_base"),
-        Source("social_ads", STEVENBLACK_SOCIAL, "stevenblack_social"),
-        Source("adult_content", STEVENBLACK_PORN, "stevenblack_porn"),
+        Source("malware_guard", URLHAUS_HOSTFILE, "urlhaus_hostfile"),
         Source("malware_guard", STEVENBLACK_FAKENEWS, "stevenblack_fakenews"),
-        Source("malware_guard", URLHAUS_HOSTFILE, "urlhaus_hostfile")
+        Source("phishing_guard", PHISHING_DATABASE, "phishing_database"),
+        Source("fingerprint_guard", STEVENBLACK_BASE, "stevenblack_base"),
+        Source("trackers", DISCONNECT_TRACKING, "disconnect_tracking"),
+        Source("trackers", STEVENBLACK_BASE, "stevenblack_base"),
+        Source("game_ads", ADAWAY_OFFICIAL, "adaway_official"),
+        Source("game_ads", DAN_POLLOCK_HOSTS, "dan_pollock_hosts"),
+        Source("game_ads", STEVENBLACK_BASE, "stevenblack_base"),
+        Source("marketplace_ads", DISCONNECT_AD, "disconnect_ad"),
+        Source("social_ads", STEVENBLACK_SOCIAL, "stevenblack_social"),
+        Source("adult_content", STEVENBLACK_PORN, "stevenblack_porn")
     )
 
     /** Kategori unik yang dikenal — dipakai untuk inisialisasi struktur kosong sebelum load pertama. */

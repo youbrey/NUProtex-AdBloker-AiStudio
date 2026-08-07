@@ -46,15 +46,50 @@ object BlocklistStore {
         loadedVersionLabel = versionLabel
     }
 
+    // Urutan prioritas kategori saat pencocokan domain:
+    // Keamanan (Malware/Phishing/Fingerprinting) diperiksa LEBIH DULU sebelum
+    // kategori iklan umum, agar domain ancaman tercatat & terdeteksi dengan tepat.
+    private val CATEGORY_PRIORITY = listOf(
+        "malware_guard",
+        "phishing_guard",
+        "fingerprint_guard",
+        "trackers",
+        "social_ads",
+        "adult_content",
+        "marketplace_ads",
+        "game_ads"
+    )
+
     /**
-     * Cari kategori pertama yang memuat [domain] persis (exact match,
-     * hosts-file style — bukan wildcard/subdomain matching di fase ini).
-     * Dipanggil di jalur kritis packet loop, harus cepat & non-blocking.
+     * Cari kategori yang memuat [domain] atau subdomain utamanya
+     * (hierarchy matching: mis. `sdk.applovin.com` -> `applovin.com`).
+     * Menggunakan urutan prioritas [CATEGORY_PRIORITY] agar ancaman keamanan
+     * dan pelacak tidak tertimpa oleh kategori iklan generik.
+     * Dipanggil di jalur kritis packet loop, cepat & non-blocking.
      */
     fun categoryFor(domain: String): String? {
         val snapshot = domainsByCategory
-        for ((category, set) in snapshot) {
-            if (set.contains(domain)) return category
+        if (snapshot.isEmpty()) return null
+
+        var curr = domain.lowercase().trim().removeSuffix(".")
+        while (curr.isNotEmpty()) {
+            for (cat in CATEGORY_PRIORITY) {
+                val set = snapshot[cat]
+                if (set != null && set.contains(curr)) {
+                    return cat
+                }
+            }
+            for ((cat, set) in snapshot) {
+                if (!CATEGORY_PRIORITY.contains(cat) && set.contains(curr)) {
+                    return cat
+                }
+            }
+
+            val dotPos = curr.indexOf('.')
+            if (dotPos == -1 || dotPos == curr.lastIndexOf('.')) {
+                break
+            }
+            curr = curr.substring(dotPos + 1)
         }
         return null
     }

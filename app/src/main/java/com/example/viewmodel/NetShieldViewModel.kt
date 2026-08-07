@@ -68,7 +68,7 @@ class NetShieldViewModel(private val repository: DnsEngineRepository) : ViewMode
             val matchesFilter = when (filter) {
                 "Diblokir" -> log.isBlocked
                 "Diizinkan" -> !log.isBlocked
-                "Ancaman" -> log.category == "malware_guard" || log.category == "phishing_guard" || log.threatLevel != "NONE"
+                "Ancaman" -> log.category == "malware_guard" || log.category == "phishing_guard" || log.category == "fingerprint_guard" || log.threatLevel != "NONE"
                 else -> true
             }
             matchesQuery && matchesFilter

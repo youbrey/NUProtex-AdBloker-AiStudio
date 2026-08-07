@@ -315,6 +315,7 @@ fun DashboardScreen(
                 "game_ads" -> Icons.Filled.SportsEsports
                 "marketplace_ads" -> Icons.Filled.ShoppingBag
                 "trackers" -> Icons.Filled.Radar
+                "fingerprint_guard" -> Icons.Filled.Security
                 "malware_guard" -> Icons.Filled.Security
                 else -> Icons.Filled.CheckCircle
             }

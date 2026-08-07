@@ -526,7 +526,7 @@ fun ThreatDatabaseTab(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Guarded Categories:", fontSize = 13.sp, color = TextSecondary)
-            Text("Ads, Trackers, Malware, Phishing", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Text("Ads, Trackers, Fingerprinting, Malware, Phishing", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
         }
 
         Spacer(modifier = Modifier.height(24.dp))

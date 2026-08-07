@@ -57,6 +57,15 @@ data class FilterOption(
                 badgeColorHex = "#00E5FF"
             ),
             FilterOption(
+                id = "fingerprint_guard",
+                title = "Blokir Fingerprinting & Profiling",
+                description = "Mencegah situs atau aplikasi melakukan device fingerprinting & profiling identitas HP",
+                isEnabled = true,
+                iconRes = "fingerprint",
+                ruleCount = 0,
+                badgeColorHex = "#AA00FF"
+            ),
+            FilterOption(
                 id = "adult_content",
                 title = "Filter Konten Dewasa & SafeSearch",
                 description = "Paksa SafeSearch di peramban & blokir situs tidak pantas",

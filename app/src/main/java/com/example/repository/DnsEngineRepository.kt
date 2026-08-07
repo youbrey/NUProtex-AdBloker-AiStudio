@@ -181,6 +181,9 @@ class DnsEngineRepository(private val context: Context) {
             blocklistUpdateManager.loadFromDiskCacheIfAvailable()
             refreshRuleCountsFromStore()
             loadStatsFromRoom()
+            if (BlocklistStore.isEmpty()) {
+                updateThreatDatabase()
+            }
         }
         scope.launch {
             dnsQueryEvents.collect { event -> persistDnsQueryEvent(event) }
@@ -242,7 +245,8 @@ class DnsEngineRepository(private val context: Context) {
         val clientLabel = event.clientHint.ifBlank { "Trafik Perangkat (VPN)" }
         val isThreat = event.isBlocked && (
             event.category == BlocklistEngine.CATEGORY_MALWARE_GUARD ||
-            event.category == BlocklistEngine.CATEGORY_PHISHING_GUARD
+            event.category == BlocklistEngine.CATEGORY_PHISHING_GUARD ||
+            event.category == BlocklistEngine.CATEGORY_FINGERPRINT_GUARD
         )
 
         dao.insertDnsLog(
@@ -278,29 +282,29 @@ class DnsEngineRepository(private val context: Context) {
         // tanpa keterlibatan random/tombol simulasi apa pun. Lihat
         // RENCANA_PRODUKSI_NETSHIELD.md §Fase 4.
         if (isThreat) {
-            recordRealThreatEvent(domain = event.domain, clientLabel = clientLabel)
+            recordRealThreatEvent(domain = event.domain, category = event.category, clientLabel = clientLabel)
         }
     }
 
     /**
      * Mencatat satu insiden ancaman NYATA (domain diblokir oleh kategori
-     * malware_guard, hasil pencocokan blocklist StevenBlack fakenews +
-     * URLhaus — lihat [com.example.vpn.BlocklistSource]) ke tabel
-     * `threat_events` dan mengirim notifikasi push. Menggantikan
-     * `triggerThreatSimulationAlert()` lama yang memilih domain fiktif
-     * secara acak (Fase 4.1).
-     *
-     * Penamaan sengaja TIDAK memakai istilah "AI" (Fase 4.2) — deteksi ini
-     * murni pencocokan domain terhadap daftar blocklist statis (rule-based),
-     * bukan model machine learning. Lihat catatan transparansi produk di
-     * RENCANA_PRODUKSI_NETSHIELD.md §Fase 4.2.
+     * malware_guard, phishing_guard, atau fingerprint_guard) ke tabel
+     * `threat_events` dan mengirim notifikasi push.
      */
-    private suspend fun recordRealThreatEvent(domain: String, clientLabel: String) {
+    private suspend fun recordRealThreatEvent(domain: String, category: String, clientLabel: String) {
+        val (tType, tDesc) = when (category) {
+            BlocklistEngine.CATEGORY_PHISHING_GUARD ->
+                Pair("Phishing Guard", "Query DNS ke domain terdaftar di database phishing aktif berhasil dicegah sebelum resolusi.")
+            BlocklistEngine.CATEGORY_FINGERPRINT_GUARD ->
+                Pair("Anti-Fingerprinting Guard", "Upaya tracker melakukan device fingerprinting & profiling identitas HP berhasil diblokir.")
+            else ->
+                Pair("Malware Guard", "Query DNS ke domain terdaftar di database malware & trojan (URLhaus) berhasil dicegah sebelum resolusi.")
+        }
         val threat = ThreatEventEntity(
             domain = domain,
-            threatType = "Malware & Phishing (Rule-based Blocklist)",
+            threatType = tType,
             severity = "HIGH",
-            description = "Query DNS ke domain yang terdaftar di database ancaman malware/phishing (StevenBlack fakenews + URLhaus) berhasil dicegah sebelum resolusi.",
+            description = tDesc,
             actionTaken = "TERBLOKIR OTOMATIS (DNS NXDOMAIN)"
         )
         dao.insertThreatEvent(threat)

@@ -353,7 +353,7 @@ fun AlertItemCard(
     log: DnsLogEntity,
     onClick: () -> Unit
 ) {
-    val isThreat = log.category == "malware_guard" || log.category == "phishing_guard" || log.threatLevel != "NONE"
+    val isThreat = log.category == "malware_guard" || log.category == "phishing_guard" || log.category == "fingerprint_guard" || log.threatLevel != "NONE"
 
     val iconVec = when {
         isThreat -> Icons.Filled.Security

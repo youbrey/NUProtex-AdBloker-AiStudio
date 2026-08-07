@@ -6,6 +6,29 @@ per Fase sesuai `RENCANA_PRODUKSI_NETSHIELD.md`. Format mengacu longgar pada
 
 ---
 
+## [Fase 5] — 2026-08-07 — Fingerprinting Guard, Game Ads Expansion & Project Clean
+
+### Ditambahkan
+- **Blokir Fingerprinting & Profiling (`fingerprint_guard`)**:
+  - Penambahan filter `fingerprint_guard` dengan badge warna ungu (#AA00FF) pada UI Filter & Shield.
+  - Pemblokiran domain fingerprinting populer (FingerprintJS, ThreatMetrix, Iovation, Seon, Sift, ScorecardResearch, Quantserve).
+- **Integrasi Database Ancaman & Iklan Game Tambahan**:
+  - `AdAway Official Hosts` & `Dan Pollock Hosts` untuk memblokir iklan game Android / SDK in-app.
+  - `Disconnect Simple Tracking` & `Disconnect Simple Ad` untuk perlindungan anti-tracking & anti-ad jaringan.
+  - `Phishing.Database Active Domains` untuk deteksi domain phishing secara aktual.
+- **Pencocokan Subdomain Hibrid (Subdomain Hierarchy Matching)**:
+  - Pembacaan hierarki domain otomatis di `BlocklistStore` dan `BlocklistEngine` (misal `sdk.applovin.com` -> `applovin.com`) sehingga iklan game dengan sub-domain dinamis langsung terdeteksi dan terblokir 100%.
+
+### Diubah
+- **Pembersihan Nama Proyek**:
+  - Mengubah `rootProject.name` pada `settings.gradle.kts` menjadi `"NetShield"`.
+  - Memastikan nama aplikasi konsisten antara `res/values/strings.xml`, `metadata.json`, dan `settings.gradle.kts`.
+- **Deteksi Real-Time & Security Score**:
+  - `SecurityScoreCalculator` kini memperhitungkan perlindungan `fingerprint_guard` secara riil.
+  - Deteksi ancaman di `DnsEngineRepository` kini mencatat peristiwa `Fingerprinting Guard`, `Phishing Guard`, dan `Malware Guard` langsung dari trafik paket DNS VPN secara live.
+
+---
+
 ## [Fase 0] — 2026-08-07 — Perbaikan Kritis Arsitektur
 
 ### Ditambahkan

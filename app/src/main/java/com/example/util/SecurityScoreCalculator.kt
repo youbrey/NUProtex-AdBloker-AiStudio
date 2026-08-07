@@ -46,11 +46,13 @@ object SecurityScoreCalculator {
             dohPts = 20
         }
 
-        // 3. Malware & Phishing Guard Enabled (Maks 20 poin)
+        // 3. Malware, Phishing & Fingerprinting Guard Enabled (Maks 20 poin)
         val malwareEnabled = filterOptions.any { it.id == "malware_guard" && it.isEnabled }
         val phishingEnabled = filterOptions.any { it.id == "phishing_guard" && it.isEnabled }
-        if (malwareEnabled) malwarePts += 10
-        if (phishingEnabled) malwarePts += 10
+        val fingerprintEnabled = filterOptions.any { it.id == "fingerprint_guard" && it.isEnabled }
+        if (malwareEnabled) malwarePts += 7
+        if (phishingEnabled) malwarePts += 7
+        if (fingerprintEnabled) malwarePts += 6
 
         // 4. Tracker & Telemetri Filter Enabled (Maks 15 poin)
         val trackerEnabled = filterOptions.any { it.id == "trackers" && it.isEnabled }
