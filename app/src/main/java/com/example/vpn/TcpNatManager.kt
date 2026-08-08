@@ -206,6 +206,12 @@ class TcpNatManager(
                 // (khas frame HTTP/2 pada trafik video/reels) bisa tertahan sampai 200ms
                 // menunggu digabung, menambah latensi yang terasa jelas oleh user.
                 socket.tcpNoDelay = true
+                try {
+                    socket.receiveBufferSize = TCP_SOCKET_BUFFER_BYTES
+                    socket.sendBufferSize = TCP_SOCKET_BUFFER_BYTES
+                } catch (e: Exception) {
+                    Log.d(TAG, "Gagal set ukuran buffer socket TCP (non-fatal): ${e.message}")
+                }
 
                 val session = Session(
                     socket = socket,
@@ -446,5 +452,9 @@ class TcpNatManager(
         // ~4 MB — jauh di atas batas 64KB lama, memungkinkan throughput tinggi
         // di link berlatensi lebih tinggi (video/reels/game di jaringan seluler).
         private const val ADVERTISED_WINDOW_BYTES = 65535 shl SERVER_WINDOW_SCALE_SHIFT
+        // Fase Audit-3: buffer kernel socket TCP diperbesar (default OS
+        // seringkali cukup kecil), membantu throughput di link berlatensi
+        // lebih tinggi bersamaan dengan Window Scale (Audit-2).
+        private const val TCP_SOCKET_BUFFER_BYTES = 1_048_576 // 1 MB
     }
 }

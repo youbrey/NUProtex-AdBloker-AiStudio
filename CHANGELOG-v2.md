@@ -898,3 +898,61 @@ klien. Dampak, untuk **setiap** koneksi TCP yang direlay:
   sekaligus). Belum diubah di audit ini karena solusinya (mis. writer
   queue per-tun dengan satu consumer, atau io_uring) perlu pengujian
   beban tersendiri. Direkomendasikan masuk backlog Fase 7.
+
+---
+
+## [Audit-3] — 2026-08-08 — Bug Kritis Kedua: Video/Reels Tetap Buffering & Game Lag Setelah Fix TCP
+
+### Laporan Verifikasi Fandri
+Build hasil Audit-2 (fix MSS/Window Scale TCP) sudah di-rebuild & diinstal.
+Hasil: reels/video Facebook masih macet loading, game masih lambat. Saat
+proteksi (VPN) dimatikan, semua kembali normal — membuktikan bottleneck
+masih di dalam NAT relay, bukan di luar app.
+
+### Root Cause
+Fix Audit-2 hanya menyentuh `TcpNatManager`. Reels/video & banyak game
+modern memakai **QUIC (di atas UDP)**, bukan TCP — jadi tidak tersentuh
+sama sekali oleh fix sebelumnya. Bug sesungguhnya ada di `UdpNatManager`:
+
+`readLoop()` versi lama membaca satu paket dari socket UDP lalu LANGSUNG
+memanggil `writeToTun()` (lock global bersama TCP+DNS) sebelum lanjut
+`receive()` berikutnya. Selama menunggu giliran lock itu, socket UDP TIDAK
+sedang dibaca — buffer kernel milik socket tersebut terus terisi paket
+baru dari server video/game. Karena UDP tidak reliable (tidak ada
+retransmit otomatis seperti TCP), begitu buffer kernel penuh sebelum
+sempat kita baca, **OS membuang paket itu diam-diam**. Video yang datanya
+lewat QUIC jadi kehilangan potongan data → pemutar terus menunggu
+(buffering tanpa akhir, persis di screenshot), game kehilangan update
+state → lag/tersendat.
+
+### Perbaikan
+- `UdpNatManager.kt`
+  - `readLoop()` sekarang HANYA `socket.receive()` + `trySend()` ke channel
+    baru `Session.inboundChannel` (kapasitas 256) — tidak pernah lagi
+    memanggil `writeToTun()` langsung.
+  - `tunWriterLoop()` baru: satu-satunya consumer yang menguras
+    `inboundChannel` dan memanggil `writeToTun()` — dipisah dari readLoop
+    supaya `receive()` tidak pernah tertahan oleh kontensi lock global.
+  - `socket.receiveBufferSize`/`sendBufferSize` diperbesar ke 1MB (dari
+    default OS yang seringkali jauh lebih kecil) sebagai bantalan
+    tambahan saat readLoop/tunWriterLoop sesaat sibuk.
+- `TcpNatManager.kt` — buffer socket TCP juga diperbesar ke 1MB (murah,
+  membantu throughput bersamaan dengan Window Scale dari Audit-2).
+
+### Status Verifikasi
+- [x] Perbaikan kode selesai.
+- [ ] **BELUM diverifikasi** di device fisik — WAJIB rebuild + install ulang
+  APK, lalu ulangi pengujian yang sama (Reels Facebook + Mobile Legends,
+  proteksi ON) sebelum dianggap tuntas.
+- [ ] Kalau MASIH buffering setelah ini: kemungkinan berikutnya adalah
+  `inboundChannel` kapasitas 256 masih kurang saat trafik video sangat
+  padat (banyak paket ter-log "di-drop" di Logcat filter tag
+  `UdpNatManager`) — cek Logcat, kalau log itu sering muncul, kapasitas
+  channel/berapa banyak sesi UDP aktif bersamaan (`MAX_SESSIONS=500`) perlu
+  dinaikkan lebih lanjut sebagai langkah berikutnya.
+
+### Keterbatasan yang Masih Ada
+- `MAX_SESSIONS=500` untuk UDP belum diubah di audit ini — reels/game bisa
+  membuka banyak sesi QUIC paralel sekaligus; kalau device sering
+  menyentuh batas ini (sesi lama ke-evict padahal masih aktif), itu jadi
+  kandidat berikutnya untuk diperbesar/diperbaiki algoritma eviction-nya.
