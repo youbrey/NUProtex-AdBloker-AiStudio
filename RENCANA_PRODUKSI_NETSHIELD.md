@@ -5,13 +5,14 @@ Dokumen ini adalah rencana kerja terstruktur untuk mengubah NetShield dari
 100% fungsional dan siap produksi**. Disusun berdasarkan hasil audit source code
 per 7 Agustus 2026, diperbarui berkelanjutan setiap fase.
 
-> **Update 8 Agustus 2026 — AUDIT KODE ULANG (mengabaikan klaim dokumentasi
-> lama, hanya membaca source code langsung):** Dikonfirmasi aplikasi **BUKAN
-> lagi placeholder** — lihat tabel status di bawah, ditulis ulang total dari
-> tabel lama (yang masih menggambarkan kondisi SEBELUM Fase 1 dikerjakan dan
-> sudah sangat tidak akurat). Ditemukan satu ketidaksesuaian dokumentasi vs
-> kode nyata (item 3.5 diklaim selesai padahal fungsinya tidak pernah ditulis)
-> — sudah dikoreksi. Detail lengkap di CHANGELOG.md §Audit Kode Nyata.
+> **Update 8 Agustus 2026 (lanjutan) — PENGUJIAN DEVICE FISIK PERTAMA
+> MENEMUKAN BUG KRITIS:** Fandri berhasil build & install APK ini di device
+> Android fisik untuk pertama kalinya (VPN aktif, notifikasi & dashboard
+> tampil normal). TAPI iklan judi/scam tetap lolos & data usage VPN "0 B" —
+> root cause ditemukan: rute VPN hanya whitelist IP DNS publik tertentu,
+> bukan catch-all, jadi paket tidak pernah masuk tun di jaringan device
+> Fandri. **Sudah diperbaiki (§Fase 6.10)** — WAJIB di-build ulang & diuji
+> lagi sebelum lanjut ke fase manapun.
 
 ## Status Saat Ini (Ringkasan Audit — DITULIS ULANG 2026-08-08 dari kode langsung)
 
@@ -257,6 +258,7 @@ Dilaporkan Fandri: iklan rewarded-video mempromosikan situs judi online (NX888) 
 - [x] **6.5** Review permission di `AndroidManifest.xml` — ditambahkan `FOREGROUND_SERVICE_SPECIAL_USE` dan `android:foregroundServiceType="specialUse"` untuk kepatuhan Android 14+ / targetSdk 36.
 - [x] **6.6** Pastikan **tidak ada logging domain yang dikunjungi user dikirim keluar device** — diverifikasi: seluruh DNS log tersimpan murni di Room DB lokal (`dns_logs`).
 - [x] **6.7** Tambahkan kebijakan privasi & disclosure jelas — ditambahkan kartu "Your Privacy Matters" dan penjelasan transparan pada `SettingsScreen.kt`.
+- [x] **6.10 (BARU, prioritas tertinggi — bug kritis dari pengujian device fisik pertama)** `NetShieldVpnService.startVpn()` HANYA memakai `addRoute()` untuk daftar IP DNS publik tertentu (1.1.1.1/8.8.8.8/9.9.9.9/dst.), BUKAN catch-all — padahal komentar changelog Fase 1 di file yang sama mengklaim rute catch-all `0.0.0.0/0` sudah ada (klaim itu SALAH, tidak pernah benar-benar diimplementasikan). **Dampak nyata dikonfirmasi Fandri via screenshot device fisik**: notifikasi & dashboard menampilkan "Proteksi Aktif"/"System Protection Active" dengan Security Score 95%, TAPI data usage VPN menunjukkan "Hari ini: 0 B" dan iklan judi/scam tetap lolos mentah-mentah — karena DNS server aktif di jaringan device tidak ada di whitelist sempit itu, sehingga TIDAK ADA paket sama sekali yang masuk ke tun. **Fix:** rute whitelist diganti `addRoute("0.0.0.0", 0)` + `addRoute("::", 0)` (catch-all) — aman karena `PacketTunnel` sudah punya NAT relay penuh (`TcpNatManager`/`UdpNatManager`) untuk trafik non-DNS. Lihat detail lengkap di `NetShieldVpnService.kt` (changelog Fase 6.10) & `CHANGELOG.md`.
 
 ---
 

@@ -25,11 +25,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * VpnService inti NetShield. Mengelola tun interface lokal untuk
  * penyaringan DNS.
  *
- * STATUS (Fase 1 selesai): tunnel VPN sekarang benar-benar memproses paket
- * lewat [PacketTunnel] — query DNS dicegat, dicocokkan ke aturan blokir,
- * dan diputuskan (blokir lokal / forward ke upstream terpilih); trafik
- * non-DNS di-relay apa adanya lewat NAT sederhana (UDP/TCP) supaya internet
- * tetap berjalan normal. Lihat RENCANA_PRODUKSI_NETSHIELD.md §Fase 1.
+ * STATUS (per Fase 6.10): tunnel VPN memproses SEMUA trafik (catch-all
+ * 0.0.0.0/0 + ::/0) lewat [PacketTunnel] — query DNS (port 53) dicegat,
+ * dicocokkan ke aturan blokir, dan diputuskan (blokir lokal / forward ke
+ * upstream terpilih); trafik non-DNS di-relay transparan lewat NAT
+ * TCP/UDP (`TcpNatManager`/`UdpNatManager`) supaya internet tetap
+ * berjalan normal. Lihat RENCANA_PRODUKSI_NETSHIELD.md §Fase 6.10.
  *
  * === CHANGELOG ===
  * [Fase 0 - 2026-08-07]
@@ -42,9 +43,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    dari luar (Settings > VPN, atau VPN app lain mengambil alih).
  *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 0.
  * [Fase 1 - 2026-08-07]
- *  - Ditambahkan `Builder.addRoute("0.0.0.0", 0)` — WAJIB supaya seluruh
- *    trafik (bukan cuma DNS) benar-benar masuk ke tun interface; tanpa ini
- *    packet loop tidak akan pernah menerima paket apa pun.
+ *  - **[DIKOREKSI Fase 6.10, lihat di bawah]** Entri ini SEBELUMNYA mengklaim
+ *    `Builder.addRoute("0.0.0.0", 0)` sudah ditambahkan — klaim itu SALAH,
+ *    baris tersebut tidak pernah benar-benar ada di kode sampai Fase 6.10.
  *  - DNS server tunnel (`addDnsServer`) sekarang dari
  *    `repository.selectedProviderSnapshot()`, hardcode 1.1.1.1/1.0.0.1
  *    dihapus (Fase 1.6).
@@ -74,6 +75,28 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    toggleProtection), jadi tanpa sinkronisasi ini UI tidak pernah tahu
  *    proteksi sudah dimatikan dari notifikasi.
  *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 6.1.
+ * [Fase 6.10 - 2026-08-08] **BUG KRITIS ditemukan lewat pengujian device
+ * fisik pertama** (laporan Fandri: VPN aktif/notifikasi muncul, tapi
+ * "Hari ini: 0 B" trafik & iklan tetap lolos mentah-mentah):
+ *  - Root cause: `Builder` HANYA memakai `addRoute()` untuk daftar IP DNS
+ *    publik tertentu (1.1.1.1/8.8.8.8/9.9.9.9/dst.), BUKAN catch-all —
+ *    berlawanan dengan klaim di entri "[Fase 1]" di atas yang ternyata
+ *    tidak pernah benar-benar diimplementasikan. Akibatnya: jika DNS
+ *    server aktif di jaringan device (mis. IP router WiFi lokal/DNS ISP
+ *    spesifik) tidak ada di daftar whitelist itu, TIDAK ADA paket sama
+ *    sekali yang masuk ke tun — proteksi 0% aktif walau UI/notifikasi
+ *    menampilkan "Aktif" (VPN interface berhasil `establish()`, tapi
+ *    tidak pernah dilewati trafik apa pun akibat routing table OS).
+ *  - Fix: `addRoute("1.1.1.1",32)` dkk. (whitelist sempit) DIGANTI
+ *    `addRoute("0.0.0.0", 0)` + `addRoute("::", 0)` (catch-all,
+ *    menangkap SEMUA trafik apa pun DNS server yang dipakai). Ini aman
+ *    karena `PacketTunnel` sudah punya NAT relay penuh untuk trafik
+ *    non-DNS (`TcpNatManager`/`UdpNatManager`, sudah ada sejak Fase 1 —
+ *    bukan kode baru), jadi trafik non-DNS tetap di-relay transparan;
+ *    hanya port 53 yang benar-benar diperiksa `BlocklistEngine`.
+ *  - Blok `addRoute(provider.primaryIp/secondaryIp)` dihapus karena jadi
+ *    redundan (sudah tercakup catch-all).
+ *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 6.10.
  */
 class NetShieldVpnService : VpnService() {
 
@@ -145,28 +168,30 @@ class NetShieldVpnService : VpnService() {
                     .addAddress(LOCAL_DNS_IPV6, 128)
                     .addDnsServer(TUNNEL_ADDRESS)
                     .addDnsServer(LOCAL_DNS_IPV6)
-                    // Rute khusus IP DNS agar HANYA trafik query DNS yang masuk ke TUN interface.
-                    // Seluruh trafik non-DNS (HTTP/HTTPS, video, audio, gaming, download)
-                    // berjalan langsung via Wi-Fi / Cellular dengan kecepatan 100% penuh.
-                    .addRoute(TUNNEL_ADDRESS, 32)
-                    .addRoute(LOCAL_DNS_IPV6, 128)
-                    .addRoute("1.1.1.1", 32)
-                    .addRoute("1.0.0.1", 32)
-                    .addRoute("8.8.8.8", 32)
-                    .addRoute("8.8.4.4", 32)
-                    .addRoute("9.9.9.9", 32)
-                    .addRoute("149.112.112.112", 32)
-                    .addRoute("206.189.255.1", 32)
-                    .addRoute("2606:4700:4700::1111", 128)
-                    .addRoute("2001:4860:4860::8888", 128)
+                    // Fase 6.10 (audit device fisik 2026-08-08): SEBELUMNYA di sini
+                    // hanya ada addRoute() untuk daftar IP DNS publik tertentu
+                    // (1.1.1.1, 8.8.8.8, 9.9.9.9, dst.) — desain "DNS-only route"
+                    // yang TERBUKTI GAGAL di pengujian device nyata: jaringan
+                    // WiFi/provider yang memakai DNS server DI LUAR daftar itu
+                    // (mis. IP router lokal/DNS ISP spesifik) membuat query DNS
+                    // TIDAK PERNAH masuk ke tun sama sekali — proteksi 0% aktif
+                    // walau UI menampilkan "Aktif" (VPN interface berhasil
+                    // dibuat, tapi tidak pernah dilewati trafik apa pun).
+                    // Diganti catch-all 0.0.0.0/0 + ::/0: SEMUA trafik sekarang
+                    // masuk tun apa pun DNS server yang dipakai jaringan aktif.
+                    // Ini AMAN karena PacketTunnel sudah punya NAT relay penuh
+                    // untuk trafik non-DNS (TcpNatManager/UdpNatManager, sudah
+                    // ada sejak awal, bukan kode baru) — trafik non-DNS
+                    // di-relay transparan, hanya port 53 yang benar-benar
+                    // diperiksa BlocklistEngine.
+                    .addRoute("0.0.0.0", 0)
+                    .addRoute("::", 0)
                     .setMtu(PacketTunnel.MTU_BUFFER_SIZE)
 
-                try {
-                    if (provider.primaryIp.isNotBlank()) builder.addRoute(provider.primaryIp, 32)
-                    if (provider.secondaryIp.isNotBlank()) builder.addRoute(provider.secondaryIp, 32)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Tidak dapat menambah provider IP ke route: ${e.message}")
-                }
+                // Fase 6.10: addRoute per-provider IP TIDAK diperlukan lagi —
+                // sudah tercakup otomatis oleh catch-all 0.0.0.0/0 di atas.
+                // (Sebelumnya ada blok try-catch addRoute(provider.primaryIp)
+                // di sini; dihapus karena jadi kode mati/redundan.)
 
                 try {
                     builder.addDisallowedApplication(packageName)

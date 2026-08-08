@@ -684,3 +684,88 @@ rencana di awal yang diasumsikan selalu terealisasi persis seperti ditulis.
    benar-benar muncul (indikasi packet loop & pencatatan Room berjalan).
 5. Cek Dashboard → statistik (Total Requests, Blocked, dst.) naik sesuai
    aktivitas nyata, bukan diam di 0.
+
+## [Fase 6.10] — 2026-08-08 — BUG KRITIS: Rute VPN Whitelist, Bukan Catch-All
+
+### Konteks — Pengujian Device Fisik Pertama
+Fandri berhasil build & install APK ini di device Android fisik (via GitHub
+Codespaces) untuk PERTAMA KALINYA. Hasil: VPN aktif (ikon kunci VPN muncul,
+notifikasi "NetShield DNS Proteksi Aktif", Dashboard menampilkan "System
+Protection Active" & Security Score 95%). Namun iklan judi online & trading
+kripto palsu (kasus NX888/Binance palsu dari sesi sebelumnya) **masih lolos
+mentah-mentah**, dan indikator data usage VPN bawaan Android menunjukkan
+**"Hari ini: 0 B"** meski baru saja bermain game.
+
+### Root Cause (ditemukan dari kode, dikonfirmasi cocok dengan gejala di device)
+`NetShieldVpnService.startVpn()` mengonfigurasi `VpnService.Builder` dengan
+`addRoute()` HANYA untuk daftar IP DNS publik tertentu (1.1.1.1, 1.0.0.1,
+8.8.8.8, 8.8.4.4, 9.9.9.9, dll.) — BUKAN rute catch-all `0.0.0.0/0`.
+
+Ironisnya, blok komentar changelog "[Fase 1]" di file yang sama sudah lama
+mengklaim: *"Ditambahkan `Builder.addRoute("0.0.0.0", 0)` — WAJIB..."* —
+**klaim ini SALAH sejak awal, baris kode itu tidak pernah benar-benar
+ditulis.** Ini adalah kasus dokumentasi-mendahului-implementasi yang tidak
+pernah disinkronkan ulang, mirip pola yang ditemukan audit kode nyata
+sebelumnya (lihat entri "[Audit Kode Nyata]" di atas) — tapi kali ini
+dampaknya BUKAN cuma dokumentasi tidak akurat, melainkan **bug fungsional
+nyata yang membuat proteksi 0% aktif** pada jaringan yang DNS server-nya
+tidak ada di whitelist sempit tersebut (mis. router WiFi rumah yang
+memakai IP lokal sebagai DNS, atau DNS spesifik dari ISP Indonesia yang
+tidak masuk 6 IP publik terkenal di atas).
+
+Karena Android VPN routing bekerja berdasar tabel rute persis (`addRoute`
+menentukan paket tujuan mana saja yang dialihkan ke tun) — kalau paket DNS
+device menuju IP yang tidak ada di rute manapun, paket itu berjalan
+langsung lewat jaringan fisik seolah VPN tidak ada, sama sekali tidak
+pernah mampir ke `PacketTunnel`. UI tetap menampilkan "Aktif" karena
+`establish()` sukses (tunnel interface berhasil dibuat) — tapi tunnel itu
+kosong, tidak dilewati apa pun.
+
+### Fix
+- `NetShieldVpnService.kt`: whitelist `addRoute()` (11 baris IP spesifik)
+  diganti 2 baris catch-all:
+  ```kotlin
+  .addRoute("0.0.0.0", 0)
+  .addRoute("::", 0)
+  ```
+- Blok `addRoute(provider.primaryIp/secondaryIp)` terpisah dihapus (sudah
+  redundan, tercakup catch-all).
+- Ini AMAN dilakukan (tidak menambah risiko kompleksitas baru) karena
+  `PacketTunnel` + `TcpNatManager` + `UdpNatManager` SUDAH punya
+  implementasi NAT relay penuh untuk trafik non-DNS sejak Fase 1 — bukan
+  kode baru yang perlu ditulis. Trafik non-DNS akan direlay transparan;
+  hanya port 53 yang benar-benar diperiksa `BlocklistEngine`.
+- Komentar changelog kelas `NetShieldVpnService` (§Fase 1, §STATUS)
+  dikoreksi agar tidak lagi mengklaim sesuatu yang ternyata tidak pernah
+  diimplementasikan.
+
+### Konsekuensi Desain yang Perlu Diketahui
+- **Semua trafik (bukan cuma DNS) sekarang lewat tun interface** — beban
+  kerja `PacketTunnel`/NAT relay jadi jauh lebih tinggi dibanding desain
+  lama yang hanya menangani port 53. Perlu diperhatikan di Fase 7
+  (testing performa/stabilitas jangka panjang) — pastikan tidak ada
+  penurunan kecepatan internet terasa & tidak ada memory leak di NAT
+  session yang menumpuk untuk koneksi TCP/UDP volume tinggi (mis.
+  streaming video, game online real-time).
+- Battery/data usage VPN akan naik signifikan dibanding sebelumnya (dulu
+  cuma DNS kecil yang lewat tun, sekarang semua trafik) — ini NORMAL &
+  diharapkan untuk desain full-tunnel, bukan bug baru.
+
+### Checklist Verifikasi Ulang (WAJIB sebelum lanjut fase manapun)
+1. Build ulang APK dari source terbaru ini, install ke device yang sama.
+2. Aktifkan proteksi, cek ikon VPN muncul seperti sebelumnya.
+3. **Cek data usage VPN naik dari 0 B** setelah browsing/main game sebentar
+   (indikator bawaan Android di notification shade, seperti screenshot
+   sebelumnya) — ini bukti utama tunnel sekarang benar-benar dilewati
+   trafik.
+4. Buka `ActivityLogScreen` — harus mulai muncul banyak entri baru
+   (sebelumnya kemungkinan kosong/sangat sedikit).
+5. Buka lagi game yang menampilkan iklan judi/scam — cek domain iklan
+   tersebut muncul di log, idealnya berkategori `gambling_scam_ads` &
+   berstatus Diblokir.
+6. **Uji kecepatan internet normal** (browsing, streaming, main game
+   online) — pastikan tidak ada penurunan drastis akibat semua trafik
+   sekarang lewat proses relay tambahan di device.
+7. Uji stabilitas: biarkan VPN aktif beberapa jam sambil dipakai normal,
+   pastikan tidak crash/force-close & tidak ada penurunan performa
+   progresif (indikasi leak di NAT session).
