@@ -23,6 +23,13 @@ import com.example.model.FilterOption
  * unduhan blocklist nyata) terlebih dahulu; SEED_BLOCKED_DOMAINS
  * diturunkan statusnya jadi fallback offline-pertama-kali saja, bukan
  * lagi sumber utama. Lihat RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.
+ * [Fase 2.7 - 2026-08-08] Ditambahkan CATEGORY_GAMBLING_SCAM_ADS —
+ * kategori baru untuk domain judi online & iklan investasi/trading palsu
+ * (mis. NX888, situs meniru UI Binance), sumber domain dari HaGeZi
+ * Gambling+Fake list (lihat BlocklistSource.kt). Diperlakukan setara
+ * kategori ancaman keamanan di DnsEngineRepository (risiko finansial
+ * nyata bagi user, bukan sekadar iklan mengganggu). Lihat CHANGELOG.md &
+ * RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
  */
 object BlocklistEngine {
 
@@ -143,6 +150,8 @@ object BlocklistEngine {
     const val CATEGORY_MALWARE_GUARD = "malware_guard"
     const val CATEGORY_PHISHING_GUARD = "phishing_guard"
     const val CATEGORY_FINGERPRINT_GUARD = "fingerprint_guard"
+    /** Fase 2.7: judi online & iklan investasi/trading palsu — diperlakukan setara ancaman (risiko finansial nyata bagi user), bukan sekadar "iklan mengganggu". */
+    const val CATEGORY_GAMBLING_SCAM_ADS = "gambling_scam_ads"
 
     data class Decision(val isBlocked: Boolean, val category: String)
 

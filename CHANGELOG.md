@@ -520,3 +520,167 @@ sesuai prinsip transparansi di rencana Fase 6.3.
 - `app/proguard-rules.pro` — ditambahkan aturan ProGuard/R8 komprehensif untuk Room, Moshi, Retrofit, OkHttp, Coroutines, dan data models NetShield.
 - `app/build.gradle.kts` — mengaktifkan `isMinifyEnabled = true` pada build type `release` dan menambahkan penanganan fallback signing configuration bila release keystore tidak ditemukan.
 
+
+## [Audit] — 2026-08-08 — Verifikasi Device Nyata: Iklan Judi In-App Lolos Blokir
+
+### Ditemukan (audit, belum ada perubahan kode)
+Laporan Fandri: iklan rewarded-video situs judi (NX888) masih tampil di game
+mahjong walau proteksi aktif; statistik dashboard juga terlihat kosong/tidak
+update. Audit menyeluruh dilakukan atas `PacketTunnel.kt`, `BlocklistEngine.kt`,
+`BlocklistStore.kt`, `BlocklistSource.kt`, `BlocklistUpdateManager.kt`,
+`DnsEngineRepository.kt`, `NetShieldViewModel.kt`, `NetShieldDao.kt`, dan
+`AndroidManifest.xml`.
+
+**Kesimpulan: bukan bug pada jalur packet-loop/stats** (wiring
+`PacketTunnel.Callbacks.onDnsQueryResolved()` → `recordDnsQueryResolved()` →
+Room → `ProtectionStats` → `NetShieldViewModel.stats` → `DashboardScreen`
+sudah benar dan konsisten saat ditelusuri baris per baris).
+
+**Root cause teridentifikasi:**
+1. `BlocklistSource.kt` hanya memuat sumber Barat generik (StevenBlack,
+   AdAway, Disconnect.me, URLhaus, Phishing Database) — tidak ada cakupan
+   untuk jaringan mediasi iklan game Asia (TopOn/Sigmob/KS Ads/GroMore) atau
+   domain CDN afiliasi judi online, yang sangat umum di game kasual asal SEA.
+2. Klaim UI "Blokir Iklan Game Fully...semua game Android" di
+   `FilterOption.kt` overclaim relatif terhadap batas nyata DNS-blocking.
+3. Statistik kosong kemungkinan besar konsekuensi wajar dari (1) — belum ada
+   query DNS nyata yang tercatat karena traffic ad tersebut memang tidak
+   pernah masuk keputusan blokir; ATAU APK yang diuji di device belum
+   merupakan build terbaru dari source ini (belum dikonfirmasi).
+
+### TODO Baru (ditambahkan ke RENCANA_PRODUKSI_NETSHIELD.md §Fase 2)
+- 2.7: Tambah sumber blocklist untuk iklan mediasi game Asia/Tenggara & domain afiliasi judi.
+- 2.8: Revisi teks klaim UI `FilterOption.kt` (hindari overclaim "Fully"/"semua").
+- 2.9: Tambah indikator diagnostik status blocklist di UI (timestamp update terakhir, jumlah domain aktif).
+
+### Rekomendasi Segera untuk Fandri (workaround, tanpa perlu kode baru)
+- Tambahkan domain iklan NX888 (setelah diidentifikasi lewat `ActivityLogScreen`) ke Custom Rules → Blokir (custom rule selalu menang atas blocklist umum).
+- Konfirmasi APK yang diuji adalah build terbaru dari source ini, dan proteksi VPN benar-benar ON saat pengujian (cek ikon kunci VPN Android + isi `ActivityLogScreen`).
+
+## [Fase 2.7] — 2026-08-08 — Blocklist Global (HaGeZi) & Kategori Judi/Scam Baru
+
+### Konteks
+Tindak lanjut audit sebelumnya: Fandri melaporkan iklan judi online (NX888)
+DAN iklan trading kripto palsu (meniru UI Binance, "Buy the dip") masih
+lolos. Kedua kasus sama-sama masuk kategori "gambling/scam ads" yang tidak
+tercakup blocklist Barat generik lama (StevenBlack/AdAway/Disconnect).
+
+### Ditambahkan
+- `BlocklistSource.kt`: 7 sumber baru dari HaGeZi/dns-blocklists (proyek
+  blocklist DNS paling komprehensif & sering diperbarui saat ini, dipakai
+  NextDNS/ControlD/Pi-hole/AdGuard Home) — Pro (global ads/tracking/scam),
+  Gambling, Fake/Fraud, Pop-Up Ads, native tracker OEM (Oppo/Realme,
+  Samsung, TikTok extended).
+- Kategori filter baru `gambling_scam_ads` ("Blokir Iklan Judi & Investasi
+  Palsu") di `FilterOption.kt`, diperlakukan setara kategori ancaman
+  keamanan (masuk `threat_events` + notifikasi push) di
+  `DnsEngineRepository.kt`.
+- `BlocklistUpdateManager.parseHostsFile()`: parser diperluas dari hanya
+  format hosts (`0.0.0.0 domain`) menjadi multi-format — AdBlock
+  (`||domain^`) dan domain polos satu baris (folder `domains/` HaGeZi) —
+  memakai `DOMAIN_REGEX` baru untuk validasi baris.
+
+### Diubah
+- `FilterOption.kt`: teks `game_ads` direvisi, menghapus klaim overclaim
+  "Fully"/"semua game Android".
+- `BlocklistStore.kt`: `gambling_scam_ads` ditambahkan ke
+  `CATEGORY_PRIORITY` (prioritas tinggi, setelah malware/phishing).
+- `BlocklistEngine.kt`: konstanta `CATEGORY_GAMBLING_SCAM_ADS` ditambahkan.
+- `NetShieldDao.kt`: `getThreatsPreventedCount()` SQL menambahkan kondisi
+  `category = 'gambling_scam_ads'`.
+- `NetShieldViewModel.kt`: filter tampilan "Ancaman" di `filteredLogs`
+  menambahkan `gambling_scam_ads`.
+
+### Belum Diverifikasi (penting)
+- **URL sumber HaGeZi belum diuji unduh langsung** dari lingkungan kerja
+  saya — tidak ada akses jaringan keluar di sandbox ini. Pola URL & nama
+  file diverifikasi lewat dokumentasi resmi proyek (GitHub README +
+  DeepWiki) per 2026-08-08, bukan lewat request HTTP nyata.
+  `BlocklistUpdateManager` sudah menangani kegagalan per-sumber secara
+  graceful (satu 404 tidak menggagalkan sumber lain), tapi **WAJIB
+  dicek Fandri**: install build ini di device fisik, tekan tombol
+  "Perbarui Database" di Settings, lalu konfirmasi jumlah domain aktif
+  bertambah signifikan (sebelumnya hanya puluhan ribu dari StevenBlack,
+  seharusnya jadi ratusan ribu dengan tambahan HaGeZi Pro).
+- Checklist verifikasi lapangan untuk kasus asli (NX888 & Binance palsu):
+  1. Update database blocklist di app.
+  2. Buka kembali game/aplikasi yang menampilkan iklan tersebut.
+  3. Cek `ActivityLogScreen` — domain iklan seharusnya muncul berkategori
+     `gambling_scam_ads` dengan status **Diblokir**.
+  4. Jika masih lolos: domain spesifik iklan tersebut kemungkinan belum
+     ada bahkan di HaGeZi Gambling/Fake list (situs judi baru sering ganti
+     domain) — gunakan Custom Rules sebagai workaround manual per domain.
+
+## [Audit Kode Nyata] — 2026-08-08 — Verifikasi Ulang Tanpa Mengacu Dokumentasi
+
+### Konteks
+Diminta Fandri secara eksplisit: audit ulang source code **tanpa mengacu ke
+dokumentasi/changelog lama**, untuk memastikan aplikasi bukan sekadar
+placeholder. Metodologi: baca langsung isi fungsi-fungsi kunci (bukan
+komentarnya), grep seluruh source untuk pola `Random()`/`delay()` palsu/
+`TODO`/`stub`, telusuri satu-satu wiring antar layer (PacketTunnel →
+NetShieldVpnService → DnsEngineRepository → Room → ViewModel → UI).
+
+### Kesimpulan
+**Aplikasi BUKAN placeholder.** Ditemukan implementasi nyata & saling
+terhubung untuk:
+- Packet loop VPN (`PacketTunnel.kt`) — baca/tulis tun fd sungguhan, parsing
+  IPv4/IPv6, checksum IP/UDP/TCP dihitung benar (pola `// checksum
+  placeholder` yang tampak di `NetPacketUtils.kt` diverifikasi HANYA nama
+  variabel sementara sebelum `internetChecksum()`/`transportChecksum()`
+  dipanggil — bukan checksum kosong yang dibiarkan 0).
+- NAT TCP (`TcpNatManager.kt`) & UDP (`UdpNatManager.kt`) — pakai
+  `java.net.Socket`/`DatagramSocket` sungguhan, bukan stub.
+- DoH (DNS-over-HTTPS, RFC 8484) via OkHttp sungguhan dengan
+  `ProtectingSocketFactory` — dikonfirmasi di `PacketTunnel.kt`.
+- Blocklist download & parsing (`BlocklistUpdateManager.kt`,
+  `BlocklistSource.kt`) — HTTP request nyata via OkHttp, parser multi-format.
+- Statistik & log (`DnsEngineRepository.kt`) — seluruh `dnsLogs`,
+  `ProtectionStats`, `threat_events` bersumber dari
+  `recordDnsQueryResolved()` (dipanggil `NetShieldVpnService` dari
+  `PacketTunnel.Callbacks`), TIDAK ADA jalur simulasi/random tersisa.
+
+### Ditemukan & Diperbaiki: Ketidaksesuaian Dokumentasi vs Kode Nyata
+1. **`RENCANA_PRODUKSI_NETSHIELD.md` item 3.5 diklaim `[x]` selesai**
+   ("Mode demo/simulasi dipertahankan HANYA di `enableDebugSimulation()`,
+   dibungkus `BuildConfig.DEBUG`") — **setelah dicek langsung, fungsi
+   `enableDebugSimulation()` dan properti `debugSimulationJob` TIDAK PERNAH
+   ditulis di kode manapun.** Dikoreksi jadi item terbuka `[ ]`.
+2. Beberapa blok komentar di `DnsEngineRepository.kt` (STATUS header, komentar
+   di `persistDnsQueryEvent()`, `startEngine()`, `close()`) merujuk fungsi
+   `triggerThreatSimulationAlert()`/`enableDebugSimulation()`/
+   `debugSimulationJob` seolah masih ada saat ini, padahal keduanya sudah
+   dihapus total sejak Fase 4.1 (untuk yang pertama) atau tidak pernah ada
+   (untuk dua lainnya). Semua referensi ini sudah diperbaiki agar akurat
+   terhadap kode sungguhan.
+3. Tabel "Status Saat Ini" di puncak `RENCANA_PRODUKSI_NETSHIELD.md` masih
+   berisi kondisi audit PALING AWAL (sebelum Fase 1 dikerjakan) — masih
+   menyatakan VpnService "tidak memproses paket" dan mesin filter "100%
+   simulasi", padahal sudah sangat tidak akurat sejak beberapa fase lalu.
+   Ditulis ulang total agar mencerminkan kode nyata saat ini.
+
+### Root Cause Ketidaksesuaian Ini (transparansi)
+Pola yang terjadi: komentar/dokumentasi ditulis pada saat rencana dibuat
+("akan mempertahankan X sebagai mode debug"), tapi implementasinya
+kemudian disederhanakan (X dihapus total, bukan diubah jadi mode debug) —
+dan dokumentasi tidak disinkronkan ulang setelah keputusan implementasi
+berubah. Pelajaran untuk ke depan: dokumentasi harus ditulis/dikoreksi
+SETELAH kode final selesai untuk satu unit kerja, bukan hanya sebagai
+rencana di awal yang diasumsikan selalu terealisasi persis seperti ditulis.
+
+### Yang TIDAK Berubah (masih sama seperti audit-audit sebelumnya)
+- Belum ada satu pun build/run nyata di Android Studio/device fisik/emulator
+  yang saya lakukan — lingkungan kerja saya tidak memiliki Android SDK.
+- URL sumber blocklist HaGeZi (Fase 2.7) belum diuji unduh langsung.
+- Keterbatasan arsitektur DNS-only tetap berlaku (lihat CHANGELOG.md §Fase
+  1, §Fase 2.7) — domain yang belum ada di blocklist manapun tetap lolos.
+
+### Checklist Verifikasi Lapangan (prioritas, belum berubah dari sebelumnya)
+1. Build project ini di Android Studio → jalankan di device fisik.
+2. Aktifkan proteksi, cek ikon kunci VPN muncul di status bar Android.
+3. Buka Settings → tekan "Perbarui Database" → cek jumlah domain aktif
+   bertambah signifikan (indikasi unduhan blocklist berhasil).
+4. Buka `ActivityLogScreen` sambil browsing/main game → cek entri baru
+   benar-benar muncul (indikasi packet loop & pencatatan Room berjalan).
+5. Cek Dashboard → statistik (Total Requests, Blocked, dst.) naik sesuai
+   aktivitas nyata, bukan diam di 0.

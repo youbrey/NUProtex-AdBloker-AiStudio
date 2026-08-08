@@ -1,38 +1,56 @@
 package com.example.vpn
 
 /**
- * Sumber blocklist domain NYATA per kategori filter (Fase 2.1).
+ * Sumber blocklist domain NYATA per kategori filter (Fase 2.1, diperluas
+ * Fase 2.7).
  *
- * Semua URL di bawah menunjuk ke daftar publik dalam format "hosts file"
- * standar (baris `0.0.0.0 domain.tld` atau `127.0.0.1 domain.tld`),
- * di-parse oleh [BlocklistUpdateManager].
+ * Setiap [Source] menunjuk ke daftar publik yang di-parse
+ * [BlocklistUpdateManager.parseHostsFile] — mendukung format hosts
+ * (`0.0.0.0 domain`), AdBlock (`||domain^`), maupun domain polos satu
+ * baris (lihat Fase 2.7).
  *
  * KETERBATASAN YANG DIDOKUMENTASIKAN SECARA TRANSPARAN (sesuai prinsip
  * kerja §5 RENCANA_PRODUKSI_NETSHIELD.md):
- * Tidak ada sumber publik gratis yang memecah domain iklan per SDK app
- * (mis. "iklan khusus game" vs "iklan khusus marketplace"). Karena itu:
- *  - `game_ads` & `marketplace_ads` & `trackers` sama-sama memakai daftar
- *    gabungan ads+tracking StevenBlack (kategori UI berbeda, tapi sumber
- *    domainnya sama — ini pemecahan kategori di level UI/UX, bukan klaim
- *    bahwa sumbernya benar-benar terpisah per app).
- *  - `social_ads` memakai ekstensi "social" resmi dari StevenBlack (domain
- *    tracker/pixel media sosial - Facebook, TikTok, dll.).
- *  - `adult_content` memakai ekstensi "porn" resmi dari StevenBlack.
- *  - `malware_guard` menggabungkan ekstensi "fakenews" StevenBlack (dipakai
- *    di sini murni sebagai sumber domain berkualitas rendah/berisiko
- *    tambahan) dengan URLhaus (abuse.ch) — daftar host malware/C2 yang
- *    benar-benar dikurasi dari data ancaman nyata, bukan iklan.
+ *  - Tidak ada sumber publik gratis yang memecah domain iklan persis per
+ *    SDK/app secara sempurna. `game_ads`/`marketplace_ads`/`trackers`
+ *    tetap banyak beririsan sumbernya — pemecahan kategori sebagian besar
+ *    di level UI/UX, bukan klaim domain-nya benar-benar eksklusif.
+ *  - URL sumber HaGeZi (di bawah) diverifikasi via dokumentasi resmi
+ *    proyek per 2026-08-08 (pola URL & keberadaan folder `hosts/`/`domains/`
+ *    dikonfirmasi lewat README & DeepWiki proyek), TAPI tidak diuji
+ *    unduh langsung dari lingkungan kerja ini (tidak ada akses jaringan
+ *    keluar di sandbox). `BlocklistUpdateManager` sudah menangani
+ *    kegagalan per-sumber secara graceful (satu sumber gagal/404 tidak
+ *    menggagalkan sumber lain) — tetap WAJIB diverifikasi Fandri lewat
+ *    tombol "Perbarui Database" setelah build & install nyata.
+ *  - `malware_guard` menggabungkan HaGeZi Pro + URLhaus (abuse.ch) +
+ *    StevenBlack fakenews — daftar host malware/C2 yang benar-benar
+ *    dikurasi dari data ancaman nyata.
+ *  - `gambling_scam_ads` (BARU, Fase 2.7) memakai HaGeZi Gambling +
+ *    HaGeZi Fake/Fraud — inilah kategori yang secara spesifik mencakup
+ *    kasus dunia nyata Fandir: iklan judi online (mis. "NX888") & iklan
+ *    investasi/trading palsu yang meniru UI Binance dkk.
  *
- * Lisensi: StevenBlack/hosts dirilis di bawah MIT License (cek repo untuk
- * detail terbaru). URLhaus (abuse.ch) hostfile disediakan gratis untuk
- * penggunaan non-komersial/keamanan — cek https://urlhaus.abuse.ch/api/
- * untuk syarat penggunaan sebelum dipakai di build release komersial.
+ * Lisensi: StevenBlack/hosts (MIT). HaGeZi/dns-blocklists (lihat
+ * https://github.com/hagezi/dns-blocklists/blob/main/LICENSE — gratis,
+ * open source, cek syarat penggunaan komersial sebelum rilis Play Store).
+ * URLhaus (abuse.ch) gratis untuk non-komersial/keamanan — cek
+ * https://urlhaus.abuse.ch/api/ untuk syarat penggunaan komersial.
  *
  * === CHANGELOG ===
  * [Fase 2 - 2026-08-07] Baru dibuat. Menggantikan
  * BlocklistEngine.SEED_BLOCKED_DOMAINS hardcoded (Fase 1) dengan definisi
- * sumber blocklist nyata yang bisa diunduh & diperbarui berkala
- * (lihat BlocklistUpdateManager, §Fase 2.3).
+ * sumber blocklist nyata yang bisa diunduh & diperbarui berkala.
+ * [Fase 2.7 - 2026-08-08] Ditambahkan sumber HaGeZi/dns-blocklists —
+ * blocklist global paling komprehensif & paling sering diperbarui saat
+ * ini (dipakai NextDNS, ControlD, Pi-hole, AdGuard Home, dll.), mencakup
+ * gambling, scam/fake, pop-up ads, & native tracker OEM Android secara
+ * eksplisit. Kategori baru `gambling_scam_ads` ditambahkan (lihat
+ * FilterOption.kt, BlocklistStore.kt, BlocklistEngine.kt,
+ * DnsEngineRepository.kt untuk perubahan terkait). Dipicu laporan
+ * langsung Fandri: iklan judi (NX888) & iklan trading kripto palsu
+ * (meniru UI Binance) lolos dari blocklist lama. Lihat CHANGELOG.md &
+ * RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
  */
 object BlocklistSource {
 
@@ -43,7 +61,7 @@ object BlocklistSource {
         val cacheKey: String
     )
 
-    // StevenBlack/hosts — daftar gabungan ads + tracking + malware dasar.
+    // ---- Sumber lama (Fase 2, dipertahankan) ----
     private const val STEVENBLACK_BASE =
         "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
     private const val STEVENBLACK_SOCIAL =
@@ -65,20 +83,57 @@ object BlocklistSource {
     private const val PHISHING_DATABASE =
         "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/phishing-domains_ACTIVE.txt"
 
+    // ---- Sumber BARU Fase 2.7: HaGeZi/dns-blocklists (format domains/, global) ----
+    // Pola URL resmi: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/{format}/{listname}.txt
+    private const val HAGEZI_PRO =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/pro.txt"
+    private const val HAGEZI_GAMBLING =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/gambling.txt"
+    private const val HAGEZI_FAKE =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/fake.txt"
+    private const val HAGEZI_POPUPADS =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/popupads.txt"
+    private const val HAGEZI_NATIVE_OPPO_REALME =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/native.oppo-realme.txt"
+    private const val HAGEZI_NATIVE_SAMSUNG =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/native.samsung.txt"
+    private const val HAGEZI_NATIVE_TIKTOK =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/native.tiktok.extended.txt"
+
     /** Semua sumber yang perlu diunduh. Satu kategori bisa punya >1 sumber (digabung saat load). */
     val ALL_SOURCES: List<Source> = listOf(
         Source("malware_guard", URLHAUS_HOSTFILE, "urlhaus_hostfile"),
         Source("malware_guard", STEVENBLACK_FAKENEWS, "stevenblack_fakenews"),
+        Source("malware_guard", HAGEZI_PRO, "hagezi_pro"),
+
         Source("phishing_guard", PHISHING_DATABASE, "phishing_database"),
+        Source("phishing_guard", HAGEZI_FAKE, "hagezi_fake"),
+
         Source("fingerprint_guard", STEVENBLACK_BASE, "stevenblack_base"),
+
         Source("trackers", DISCONNECT_TRACKING, "disconnect_tracking"),
         Source("trackers", STEVENBLACK_BASE, "stevenblack_base"),
+        Source("trackers", HAGEZI_NATIVE_OPPO_REALME, "hagezi_native_oppo_realme"),
+        Source("trackers", HAGEZI_NATIVE_SAMSUNG, "hagezi_native_samsung"),
+
         Source("game_ads", ADAWAY_OFFICIAL, "adaway_official"),
         Source("game_ads", DAN_POLLOCK_HOSTS, "dan_pollock_hosts"),
         Source("game_ads", STEVENBLACK_BASE, "stevenblack_base"),
+        Source("game_ads", HAGEZI_PRO, "hagezi_pro"),
+        Source("game_ads", HAGEZI_POPUPADS, "hagezi_popupads"),
+
         Source("marketplace_ads", DISCONNECT_AD, "disconnect_ad"),
+        Source("marketplace_ads", HAGEZI_PRO, "hagezi_pro"),
+
         Source("social_ads", STEVENBLACK_SOCIAL, "stevenblack_social"),
-        Source("adult_content", STEVENBLACK_PORN, "stevenblack_porn")
+        Source("social_ads", HAGEZI_NATIVE_TIKTOK, "hagezi_native_tiktok"),
+
+        Source("adult_content", STEVENBLACK_PORN, "stevenblack_porn"),
+
+        // BARU Fase 2.7 — langsung menjawab kasus nyata Fandri (iklan judi
+        // NX888 & iklan trading kripto palsu ala Binance).
+        Source("gambling_scam_ads", HAGEZI_GAMBLING, "hagezi_gambling"),
+        Source("gambling_scam_ads", HAGEZI_FAKE, "hagezi_fake")
     )
 
     /** Kategori unik yang dikenal — dipakai untuk inisialisasi struktur kosong sebelum load pertama. */

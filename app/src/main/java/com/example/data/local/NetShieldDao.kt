@@ -7,6 +7,14 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * === CHANGELOG ===
+ * [Fase 2.7 - 2026-08-08] `getThreatsPreventedCount()` ditambah kondisi
+ * `category = 'gambling_scam_ads'` — kategori baru judi online/investasi
+ * palsu diperlakukan setara ancaman keamanan. Lihat CHANGELOG.md &
+ * RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
+ */
+
 @Dao
 interface NetShieldDao {
 
@@ -47,7 +55,7 @@ interface NetShieldDao {
     @Query("SELECT COUNT(*) FROM dns_logs WHERE isBlocked = 1")
     suspend fun getBlockedRequestsCount(): Long
 
-    @Query("SELECT COUNT(*) FROM dns_logs WHERE threatLevel != 'NONE' OR category = 'malware_guard' OR category = 'phishing_guard'")
+    @Query("SELECT COUNT(*) FROM dns_logs WHERE threatLevel != 'NONE' OR category = 'malware_guard' OR category = 'phishing_guard' OR category = 'gambling_scam_ads'")
     suspend fun getThreatsPreventedCount(): Long
 
     @Query("SELECT AVG(latencyMs) FROM dns_logs WHERE latencyMs > 0")

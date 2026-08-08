@@ -1,5 +1,17 @@
 package com.example.model
 
+/**
+ * === CHANGELOG ===
+ * [Fase 2.7 - 2026-08-08]
+ *  - Ditambahkan kategori `gambling_scam_ads` ("Blokir Iklan Judi & Investasi
+ *    Palsu") — respons langsung atas laporan Fandri: iklan judi (NX888) &
+ *    iklan trading kripto palsu (meniru UI Binance) lolos dari filter lama.
+ *  - Teks `game_ads` direvisi (2.8): "Fully"/"semua game Android" dihapus
+ *    karena overclaim relatif terhadap batas nyata DNS-blocking (hanya
+ *    efektif untuk domain yang ada di database blocklist).
+ *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7-2.8.
+ */
+
 data class FilterOption(
     val id: String,
     val title: String,
@@ -31,12 +43,21 @@ data class FilterOption(
             ),
             FilterOption(
                 id = "game_ads",
-                title = "Blokir Iklan Game Fully",
-                description = "Hentikan popup, interstitial, & reward video ads di semua game Android",
+                title = "Blokir Iklan Game",
+                description = "Kurangi popup, interstitial, & reward video ads di game Android (efektif untuk domain yang ada di database — lihat batasan di Pengaturan)",
                 isEnabled = true,
                 iconRes = "sports_esports",
                 ruleCount = 0,
                 badgeColorHex = "#FF4081"
+            ),
+            FilterOption(
+                id = "gambling_scam_ads",
+                title = "Blokir Iklan Judi & Investasi Palsu",
+                description = "Blokir domain judi online & iklan trading/kripto palsu yang meniru platform resmi (mis. Binance palsu)",
+                isEnabled = true,
+                iconRes = "money_off",
+                ruleCount = 0,
+                badgeColorHex = "#FF3D00"
             ),
             FilterOption(
                 id = "marketplace_ads",

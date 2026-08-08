@@ -23,6 +23,9 @@ package com.example.vpn
  * === CHANGELOG ===
  * [Fase 2 - 2026-08-07] Baru dibuat, menggantikan
  * `Map<String,String>` hardcoded kecil di BlocklistEngine (Fase 1 seed).
+ * [Fase 2.7 - 2026-08-08] Tambah kategori `gambling_scam_ads` ke
+ * CATEGORY_PRIORITY (prioritas tinggi, setelah malware/phishing) —
+ * lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
  */
 object BlocklistStore {
 
@@ -47,11 +50,13 @@ object BlocklistStore {
     }
 
     // Urutan prioritas kategori saat pencocokan domain:
-    // Keamanan (Malware/Phishing/Fingerprinting) diperiksa LEBIH DULU sebelum
-    // kategori iklan umum, agar domain ancaman tercatat & terdeteksi dengan tepat.
+    // Keamanan (Malware/Phishing/Fingerprinting) + Judi&Scam diperiksa LEBIH
+    // DULU sebelum kategori iklan umum, agar domain berisiko finansial/
+    // penipuan tercatat & terdeteksi dengan tepat (Fase 2.7).
     private val CATEGORY_PRIORITY = listOf(
         "malware_guard",
         "phishing_guard",
+        "gambling_scam_ads",
         "fingerprint_guard",
         "trackers",
         "social_ads",

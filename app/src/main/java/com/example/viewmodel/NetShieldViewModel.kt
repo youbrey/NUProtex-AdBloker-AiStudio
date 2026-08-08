@@ -28,6 +28,11 @@ import kotlinx.coroutines.flow.stateIn
  *  - Ditambahkan companion object Factory untuk konstruksi via
  *    NetShieldApplication.dnsEngineRepository.
  *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 0.
+ * [Fase 2.7 - 2026-08-08]
+ *  - Filter tampilan "Ancaman" di `filteredLogs` menambahkan kategori
+ *    `gambling_scam_ads` (judi online/investasi palsu) — konsisten dengan
+ *    perubahan `DnsEngineRepository.persistDnsQueryEvent()`. Lihat
+ *    CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
  */
 class NetShieldViewModel(private val repository: DnsEngineRepository) : ViewModel() {
 
@@ -68,7 +73,7 @@ class NetShieldViewModel(private val repository: DnsEngineRepository) : ViewMode
             val matchesFilter = when (filter) {
                 "Diblokir" -> log.isBlocked
                 "Diizinkan" -> !log.isBlocked
-                "Ancaman" -> log.category == "malware_guard" || log.category == "phishing_guard" || log.category == "fingerprint_guard" || log.threatLevel != "NONE"
+                "Ancaman" -> log.category == "malware_guard" || log.category == "phishing_guard" || log.category == "fingerprint_guard" || log.category == "gambling_scam_ads" || log.threatLevel != "NONE"
                 else -> true
             }
             matchesQuery && matchesFilter

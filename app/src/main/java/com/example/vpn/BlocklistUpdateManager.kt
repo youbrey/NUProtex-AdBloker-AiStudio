@@ -40,6 +40,12 @@ import java.util.concurrent.TimeUnit
  * [Fase 2 - 2026-08-07] Baru dibuat. Implementasi Fase 2.1-2.3.
  * Menggantikan `updateThreatDatabase()` versi delay() palsu di
  * DnsEngineRepository — lihat pemanggilan baru di sana.
+ * [Fase 2.7 - 2026-08-08] `parseHostsFile()` diperluas jadi multi-format
+ * (hosts / AdBlock `||domain^` / domain polos) — lihat CHANGELOG.md &
+ * RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7. Menambahkan dukungan sumber
+ * HaGeZi (folder `domains/`), blocklist global paling komprehensif saat
+ * ini yang mencakup gambling/scam/fake secara eksplisit — lihat
+ * BlocklistSource.kt.
  */
 class BlocklistUpdateManager(context: Context) {
 
@@ -203,25 +209,57 @@ class BlocklistUpdateManager(context: Context) {
     }
 
     /**
-     * Parser format hosts file standar:
-     *   0.0.0.0 iklan.contoh.com
-     *   127.0.0.1 tracker.contoh.com
-     *   # komentar diabaikan
-     * Mengabaikan baris kosong, komentar, dan entri localhost bawaan
-     * (localhost, broadcasthost, dst.) yang lazim ada di awal file hosts.
+     * Parser multi-format untuk sumber blocklist:
+     *  1. Format hosts standar: `0.0.0.0 domain.tld` / `127.0.0.1 domain.tld`
+     *  2. Format AdBlock Plus: `||domain.tld^` (dipakai sebagian sumber HaGeZi)
+     *  3. Format domain polos: satu domain per baris tanpa prefix apa pun
+     *     (dipakai folder `domains/` HaGeZi & beberapa daftar publik lain) —
+     *     ditambahkan Fase 2.7 untuk memperluas cakupan sumber blocklist
+     *     global tanpa terbatas hanya pada format hosts-file lama.
+     * Mengabaikan baris kosong, komentar (`#`/`!`), dan entri localhost
+     * bawaan (localhost, broadcasthost, dst.) yang lazim ada di awal file
+     * hosts.
+     *
+     * === CHANGELOG ===
+     * [Fase 2.7 - 2026-08-08] Diperluas dari hanya format hosts menjadi
+     * multi-format (AdBlock & domain polos), supaya sumber HaGeZi
+     * (folder `domains/`) — blocklist global paling komprehensif saat ini,
+     * mencakup gambling/scam/fake secara eksplisit — bisa dipakai tanpa
+     * perlu parser terpisah. Lihat RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
      */
     private fun parseHostsFile(content: String): Set<String> {
         val result = HashSet<String>(content.length / 20) // estimasi kapasitas awal
         for (rawLine in content.lineSequence()) {
-            val line = rawLine.substringBefore('#').trim()
+            var line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("!")) continue
+            line = line.substringBefore('#').trim()
             if (line.isEmpty()) continue
-            val parts = line.split(Regex("\\s+"))
-            if (parts.size < 2) continue
-            val ip = parts[0]
-            if (ip != "0.0.0.0" && ip != "127.0.0.1") continue
-            val domain = parts[1].lowercase().trim()
-            if (domain.isEmpty() || domain in IGNORED_HOSTNAMES) continue
-            result.add(domain)
+
+            val domain: String? = when {
+                // Format hosts: "0.0.0.0 domain" / "127.0.0.1 domain"
+                line.startsWith("0.0.0.0 ") || line.startsWith("127.0.0.1 ") -> {
+                    val parts = line.split(Regex("\\s+"))
+                    if (parts.size >= 2) parts[1].lowercase().trim() else null
+                }
+                // Format AdBlock Plus: "||domain.tld^" (abaikan modifier setelah '$' jika ada)
+                line.startsWith("||") -> {
+                    line.removePrefix("||")
+                        .substringBefore('^')
+                        .substringBefore('$')
+                        .lowercase()
+                        .trim()
+                }
+                // Format domain polos (folder domains/ HaGeZi, OISD, dll.):
+                // satu baris = satu domain, tanpa spasi, minimal 1 titik.
+                !line.contains(' ') && line.contains('.') && DOMAIN_REGEX.matches(line) -> {
+                    line.lowercase().trim()
+                }
+                else -> null
+            }
+
+            if (domain != null && domain.isNotEmpty() && domain !in IGNORED_HOSTNAMES) {
+                result.add(domain)
+            }
         }
         return result
     }
@@ -248,6 +286,13 @@ class BlocklistUpdateManager(context: Context) {
             "localhost", "localhost.localdomain", "local", "broadcasthost",
             "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
             "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0"
+        )
+        // Validasi longgar untuk baris "domain polos" (Fase 2.7): label
+        // alfanumerik+strip dipisah titik, TLD minimal 2 huruf. Cukup untuk
+        // menyaring baris yang jelas bukan domain (mis. IPv6 literal, teks
+        // metadata) tanpa perlu validasi RFC 1035 penuh.
+        private val DOMAIN_REGEX = Regex(
+            "^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,}$"
         )
     }
 }

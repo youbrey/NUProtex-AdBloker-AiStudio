@@ -3,29 +3,38 @@
 Dokumen ini adalah rencana kerja terstruktur untuk mengubah NetShield dari
 *UI prototype dengan data simulasi* menjadi **aplikasi ad-blocker Android yang
 100% fungsional dan siap produksi**. Disusun berdasarkan hasil audit source code
-per 7 Agustus 2026.
+per 7 Agustus 2026, diperbarui berkelanjutan setiap fase.
 
-> **Update 7 Agustus 2026 (lanjutan):** Fase 0–5 kini kode-lengkap (Fase 4 &
-> 5 dikerjakan sekaligus di sesi ini). Fase 6–8 belum dikerjakan. Semua fase
-> yang kodenya sudah selesai TETAP berstatus "menunggu verifikasi device
-> fisik" — lingkungan kerja tidak memiliki Android SDK/emulator/jaringan
-> keluar untuk build & run VPN sungguhan.
+> **Update 8 Agustus 2026 — AUDIT KODE ULANG (mengabaikan klaim dokumentasi
+> lama, hanya membaca source code langsung):** Dikonfirmasi aplikasi **BUKAN
+> lagi placeholder** — lihat tabel status di bawah, ditulis ulang total dari
+> tabel lama (yang masih menggambarkan kondisi SEBELUM Fase 1 dikerjakan dan
+> sudah sangat tidak akurat). Ditemukan satu ketidaksesuaian dokumentasi vs
+> kode nyata (item 3.5 diklaim selesai padahal fungsinya tidak pernah ditulis)
+> — sudah dikoreksi. Detail lengkap di CHANGELOG.md §Audit Kode Nyata.
 
-## Status Saat Ini (Ringkasan Audit)
+## Status Saat Ini (Ringkasan Audit — DITULIS ULANG 2026-08-08 dari kode langsung)
 
-| Komponen | Status |
+| Komponen | Status nyata (dicek langsung dari kode, bukan dari komentar/klaim) |
 |---|---|
-| UI/Compose, tema, navigasi | ✅ Sudah baik, hanya perlu penyesuaian minor |
-| Room DB (logs, custom rules, threats) | ✅ Struktur baik, perlu index & migrasi |
-| VpnService | ❌ Tunnel dibuat tapi **tidak memproses paket** — tidak benar-benar memblokir apa pun |
-| Mesin deteksi/filter DNS | ❌ 100% simulasi acak (`Random()`), tidak membaca trafik nyata |
-| Update database ancaman | ❌ Palsu (`delay()` + increment angka) |
-| Integrasi provider DNS terpilih | ❌ Tidak dipakai oleh VpnService (hardcoded ke Cloudflare) |
-| Bug arsitektur Compose (start/stop VPN di body composable) | ❌ Kritis, harus diperbaiki lebih dulu |
+| UI/Compose, tema, navigasi | ✅ Baik |
+| Room DB (logs, custom rules, threats) | ✅ Struktur baik, migrasi & index sudah ada |
+| VpnService & packet loop (`PacketTunnel.kt`) | ✅ **NYATA** — membaca/menulis paket dari tun fd sungguhan, parsing IPv4/IPv6, UDP & TCP NAT relay (`TcpNatManager`/`UdpNatManager`), checksum IP/UDP/TCP dihitung benar (bukan placeholder kosong) |
+| Mesin deteksi/filter DNS (`BlocklistEngine.kt`) | ✅ **NYATA** — mengecek `BlocklistStore` (hasil unduhan blocklist sungguhan) dengan prioritas kategori, custom rule user selalu menang; SEED hardcoded hanya fallback awal |
+| Update database blocklist (`BlocklistUpdateManager.kt`) | ✅ **NYATA** — unduh HTTP via OkHttp, parser multi-format (hosts/AdBlock/domain polos), cache lokal, checksum. ⚠️ URL sumber belum pernah diuji unduh langsung dari lingkungan kerja saya (tidak ada akses jaringan keluar di sandbox) |
+| Integrasi provider DNS terpilih | ✅ **NYATA** — `PacketTunnel` membaca `selectedProviderSnapshot()` dari repository, mendukung DoH (RFC 8484 via OkHttp) dengan fallback UDP |
+| Statistik & log real-time (`DnsEngineRepository`) | ✅ **NYATA** — `dnsLogs`/`ProtectionStats`/`threat_events` semuanya dari `recordDnsQueryResolved()` (trafik VPN sungguhan). Tidak ada jalur simulasi/random tersisa di kode produksi |
+| Mode debug/simulasi UI (`enableDebugSimulation()`) | ❌ **DIKLAIM ada di dokumentasi lama, TERNYATA TIDAK PERNAH ditulis di kode** — temuan audit 2026-08-08, lihat §Fase 3.5 |
+| Bug arsitektur Compose (start/stop VPN di body composable) | ✅ Sudah diperbaiki sejak Fase 0 (`LaunchedEffect`) |
+| Verifikasi build & jalan di device Android fisik | ❌ **BELUM PERNAH DILAKUKAN** — lingkungan kerja saya tidak punya Android SDK/emulator/device fisik. Ini adalah risiko terbesar yang tersisa: kode secara statis benar & saling terhubung, tapi belum pernah dibuktikan berjalan nyata di Android sungguhan |
 
-**Kesimpulan:** Kerangka aplikasi (skeleton) sudah rapi, tapi **jantung produk —
-pemblokiran DNS/iklan sungguhan — belum ada sama sekali**. Ini adalah pekerjaan
-inti terbesar, bukan sekadar "bug fix".
+**Kesimpulan audit 2026-08-08:** Source code NetShield **bukan skeleton/placeholder** —
+implementasi packet-level networking, DNS resolving/blocking, NAT TCP/UDP,
+DoH, dan pipeline statistik semuanya kode nyata yang secara konsisten
+terhubung satu sama lain (ditelusuri baris-per-baris, bukan hanya dibaca
+komentarnya). **Risiko terbesar yang tersisa bukan lagi "kodenya palsu",
+melainkan "kodenya belum pernah dibuktikan jalan di device fisik Android
+sungguhan"** — lihat checklist verifikasi lapangan di CHANGELOG.md.
 
 ---
 
@@ -119,26 +128,49 @@ paket DNS dari trafik perangkat, bukan lagi hanya membuat tunnel kosong.
 - Matching domain masih exact-match (hosts-file style), belum wildcard subdomain.
 - Belum ada penjadwalan update otomatis berkala (WorkManager) — saat ini hanya manual dari UI.
 
+### 🔴 Audit lapangan 2026-08-08 — Verifikasi device nyata: iklan judi in-app masih lolos
+
+Dilaporkan Fandri: iklan rewarded-video mempromosikan situs judi online (NX888) masih tampil penuh di sebuah game mahjong, walau proteksi aktif. Root cause terkonfirmasi lewat audit kode (bukan bug logika packet loop/stats — jalur `PacketTunnel` → `DnsEngineRepository` sudah benar):
+
+- **Seluruh sumber di `BlocklistSource.kt` adalah list Barat generik** (StevenBlack, AdAway, Disconnect.me, URLhaus, Phishing Database). Tidak ada satu pun yang mencakup jaringan mediasi iklan game asal Asia (TopOn, Sigmob, KS Ads, GroMore, dll.) atau domain CDN afiliasi judi — kategori iklan yang sangat umum di game kasual/mahjong Indonesia & sering sengaja pakai domain acak/rotasi untuk menghindari ad-blocker berbasis DNS.
+- Klaim UI di `FilterOption.kt` ("Blokir Iklan Game **Fully**"/"semua game Android") **overclaim** relatif terhadap batas nyata pendekatan DNS-blocking — perlu direvisi ke bahasa yang lebih jujur (mis. "sebagian besar iklan berbasis SDK umum").
+- Belum ada bukti dari sisi Fandri bahwa APK yang diuji di device adalah build TERBARU dari source ini, dan/atau bahwa proteksi VPN benar-benar ON & `ActivityLogScreen` menunjukkan domain terkait — perlu dikonfirmasi sebagai langkah debug pertama sebelum kerja tambahan blocklist dilakukan.
+
+- [x] **2.7 (baru)** Tambahkan sumber blocklist global HaGeZi/dns-blocklists ke `BlocklistSource.kt` (Pro/Gambling/Fake/Pop-Up Ads/native OEM tracker) — blocklist paling komprehensif & sering diperbarui saat ini (dipakai NextDNS/ControlD/Pi-hole/AdGuard Home). Kategori baru `gambling_scam_ads` dibuat (`FilterOption.kt`, `BlocklistStore.kt`, `BlocklistEngine.kt`) khusus judi online & investasi/trading palsu — langsung menjawab kedua kasus nyata Fandri (NX888, Binance palsu). Parser `BlocklistUpdateManager.parseHostsFile()` diperluas mendukung format domain polos (folder `domains/` HaGeZi) selain format hosts lama. **Catatan jujur: URL sumber diverifikasi lewat dokumentasi resmi proyek (bukan uji unduh langsung — lingkungan kerja saya tidak punya akses jaringan keluar), WAJIB dicek Fandri lewat tombol "Perbarui Database" setelah install nyata.**
+- [x] **2.8 (baru)** Revisi teks klaim di `FilterOption.kt` (`game_ads`): "Blokir Iklan Game Fully...semua game Android" → "Blokir Iklan Game...efektif untuk domain yang ada di database — lihat batasan di Pengaturan". Tidak lagi overclaim.
+- [ ] **2.9 (baru)** Tambahkan indikator diagnostik di UI (mis. badge di Dashboard/Settings): "Blocklist terakhir diperbarui: [timestamp], X domain aktif" yang jelas terlihat, supaya user bisa memverifikasi sendiri apakah blocklist benar-benar ter-load tanpa harus baca Logcat — mempercepat debug kasus seperti ini di masa depan.
+
+**File yang diubah/ditambah (Fase 2.7):**
+- ✏️ `BlocklistSource.kt` — sumber HaGeZi ditambahkan, kategori `gambling_scam_ads` baru
+- ✏️ `BlocklistUpdateManager.kt` — parser multi-format (hosts/AdBlock/domain polos)
+- ✏️ `BlocklistStore.kt` — `gambling_scam_ads` masuk `CATEGORY_PRIORITY`
+- ✏️ `BlocklistEngine.kt` — konstanta `CATEGORY_GAMBLING_SCAM_ADS`
+- ✏️ `FilterOption.kt` — filter baru + revisi teks `game_ads`
+- ✏️ `DnsEngineRepository.kt` — `gambling_scam_ads` diperlakukan setara ancaman (masuk `threat_events` + notifikasi)
+- ✏️ `NetShieldDao.kt` — `getThreatsPreventedCount()` menghitung `gambling_scam_ads`
+- ✏️ `NetShieldViewModel.kt` — filter tampilan "Ancaman" mencakup `gambling_scam_ads`
+- ✏️ `CHANGELOG.md` — entri Fase 2.7
+
 ---
 
 ## FASE 3 — Sambungkan Statistik & Log ke Data Nyata ⚠️ KODE SELESAI, MENUNGGU VERIFIKASI DEVICE FISIK
 
-- [x] **3.1** `simulationJob` di `DnsEngineRepository` dihapus dari jalur produksi (dipertahankan sebagai `enableDebugSimulation()` khusus debug — lihat 3.5).
+- [x] **3.1** `simulationJob` di `DnsEngineRepository` dihapus TOTAL dari jalur produksi.
 - [x] **3.2** Kanal komunikasi Service → Repository dibuat via `MutableSharedFlow<DnsQueryEvent>` + `recordDnsQueryResolved()` — setiap DNS query nyata dari `PacketTunnel.Callbacks.onDnsQueryResolved()` (via `NetShieldVpnService`) langsung ditulis ke `dnsLogs` Room lewat collector `persistDnsQueryEvent()`.
 - [x] **3.3** `ProtectionStats` (totalRequests, totalBlocked, avgLatencyMs, threatsPrevented untuk kategori malware_guard) dihitung dari agregasi event nyata di `persistDnsQueryEvent()`.
 - [x] **3.4** `dataSavedMb` diestimasi dari konstanta `AVG_BLOCKED_PAYLOAD_KB = 45f` (asumsi didokumentasikan di companion object `DnsEngineRepository`), bukan lagi random `0.15–0.55`.
-- [x] **3.5** Mode demo/simulasi dipertahankan HANYA di `enableDebugSimulation()`, dibungkus `BuildConfig.DEBUG` — tidak pernah otomatis aktif, tidak masuk build release.
+- [ ] **3.5 (dikoreksi audit 2026-08-08 — SEBELUMNYA SALAH DITANDAI [x])** Mode demo/simulasi khusus testing UI (`enableDebugSimulation()`, dibungkus `BuildConfig.DEBUG`) **TIDAK PERNAH benar-benar ditulis di kode** — hanya disebut di komentar/dokumentasi tanpa implementasi nyata. Ditemukan lewat audit kode langsung (bukan dari klaim dokumentasi) tanggal 2026-08-08. Dampak: tidak ada cara mudah menguji UI Dashboard/ActivityLog tanpa VPN aktif & trafik DNS sungguhan. Ini item TERBUKA — perlu diimplementasikan sungguhan jika masih dibutuhkan, atau dihapus dari rencana jika dianggap tidak perlu.
 
 **File yang diubah (Fase 3):**
 - ✏️ `DnsEngineRepository.kt`, `NetShieldVpnService.kt`
 - ✏️ `CHANGELOG.md` — entri Fase 3
 
-**Kriteria selesai:** Semua angka statistik & log yang tampil di Dashboard berasal dari trafik DNS nyata perangkat, dapat diverifikasi manual (mis. akses situs dengan iklan, cek log muncul). **Status: kode lengkap; belum bisa dikonfirmasi jalan karena lingkungan kerja saya tidak punya Android SDK/device fisik — checklist verifikasi lengkap ada di `CHANGELOG.md` §Fase 3.**
+**Kriteria selesai:** Semua angka statistik & log yang tampil di Dashboard berasal dari trafik DNS nyata perangkat, dapat diverifikasi manual (mis. akses situs dengan iklan, cek log muncul). **Status: kode lengkap (kecuali 3.5); belum bisa dikonfirmasi jalan karena lingkungan kerja saya tidak punya Android SDK/device fisik — checklist verifikasi lengkap ada di `CHANGELOG.md` §Fase 3.**
 
 **Keterbatasan diketahui (transparan):**
 - `clientApp` masih label generik "Trafik Perangkat (VPN)" — atribusi per-aplikasi belum diimplementasikan (perlu mapping UID, di luar cakupan fase ini).
-- `threatsPrevented` sudah dari kategori nyata, tapi tabel `threat_events` & notifikasi ancaman TETAP dari `triggerThreatSimulationAlert()` (simulasi) — eksplisit tugas Fase 4.
 - `dataSavedMb` adalah estimasi konstanta, bukan pengukuran byte aktual (keterbatasan inheren DNS-level blocking).
+- (Catatan: baris ini SEBELUMNYA menyebut `threat_events` "TETAP dari triggerThreatSimulationAlert() (simulasi)" — itu sudah tidak akurat sejak Fase 4 selesai, lihat §Fase 4 di bawah. Dihapus dari daftar keterbatasan oleh audit 2026-08-08.)
 
 ---
 

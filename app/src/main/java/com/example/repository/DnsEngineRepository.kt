@@ -38,9 +38,16 @@ import kotlinx.coroutines.launch
  * tempat lain (mis. langsung di ViewModel), karena akan menduplikasi
  * CoroutineScope dan job simulasi/uptime yang berjalan di background.
  *
- * STATUS (Fase 3 selesai untuk log/stats): dnsLogs & ProtectionStats kini
- * bersumber dari trafik nyata VpnService (lihat recordDnsQueryResolved()).
- * threat_events masih dari triggerThreatSimulationAlert() (tugas Fase 4).
+ * STATUS (per audit kode nyata 2026-08-08 — lihat CHANGELOG.md §Audit
+ * Kode Nyata): dnsLogs, ProtectionStats, DAN threat_events semuanya
+ * bersumber dari trafik nyata VpnService (recordDnsQueryResolved() →
+ * persistDnsQueryEvent() → recordRealThreatEvent()). TIDAK ADA lagi
+ * jalur simulasi/random di kode produksi. Satu ketidaksesuaian
+ * ditemukan & diperbaiki oleh audit ini: komentar/RENCANA_PRODUKSI
+ * sebelumnya mengklaim ada `enableDebugSimulation()`/`debugSimulationJob`
+ * (mode demo khusus BuildConfig.DEBUG) — SETELAH DICEK, fungsi ini
+ * TIDAK PERNAH benar-benar ditulis di kode manapun. Klaim ini sudah
+ * dikoreksi (lihat RENCANA_PRODUKSI_NETSHIELD.md §Fase 3.5).
  * Lihat RENCANA_PRODUKSI_NETSHIELD.md untuk detail tiap fase.
  *
  * === CHANGELOG ===
@@ -68,9 +75,13 @@ import kotlinx.coroutines.launch
  *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.
  * [Fase 3 - 2026-08-07]
  *  - `simulationJob` (generator query acak) DIHAPUS dari jalur produksi
- *    (Fase 3.1). Kode simulasi lama dipertahankan HANYA sebagai
- *    `debugSimulationJob`, dibungkus `BuildConfig.DEBUG` (Fase 3.5) —
- *    tidak pernah aktif otomatis, dan tidak akan pernah masuk build release.
+ *    (Fase 3.1). **KOREKSI audit 2026-08-08**: entri ini SEBELUMNYA
+ *    mengklaim kode simulasi "dipertahankan sebagai `debugSimulationJob`
+ *    dibungkus BuildConfig.DEBUG (Fase 3.5)" — setelah diperiksa ulang
+ *    langsung dari kode (bukan dari klaim dokumentasi), fungsi/properti
+ *    tersebut TIDAK PERNAH ditulis. simulationJob benar-benar DIHAPUS
+ *    TOTAL, tidak ada mode demo/debug pengganti. Lihat
+ *    RENCANA_PRODUKSI_NETSHIELD.md §Fase 3.5 (dikoreksi ke item terbuka).
  *  - Ditambahkan kanal komunikasi Service → Repository:
  *    `MutableSharedFlow<DnsQueryEvent>` + `recordDnsQueryResolved()` publik
  *    yang dipanggil `NetShieldVpnService` dari `PacketTunnel.Callbacks`
@@ -99,6 +110,17 @@ import kotlinx.coroutines.launch
  *    layar; insiden tetap 100% tercatat di threat_events, hanya
  *    pengiriman notifikasi yang dihemat. Lihat [sendThreatNotification].
  *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 4 dan §Fase 5.
+ * [Fase 2.7 - 2026-08-08]
+ *  - Audit lapangan (laporan Fandri): iklan judi online (NX888) & iklan
+ *    trading kripto palsu (meniru UI Binance) lolos dari blocklist lama
+ *    (StevenBlack/AdAway/Disconnect saja tidak cukup global). Ditambahkan
+ *    sumber HaGeZi/dns-blocklists (lihat BlocklistSource.kt) + kategori
+ *    baru `gambling_scam_ads`.
+ *  - `persistDnsQueryEvent()`: domain kategori `gambling_scam_ads` yang
+ *    diblokir sekarang ikut dihitung `isThreat` (risiko finansial nyata),
+ *    dicatat ke `threat_events`, & memicu notifikasi — sama seperti
+ *    malware/phishing/fingerprint guard.
+ *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 2.7.
  */
 class DnsEngineRepository(private val context: Context) {
 
@@ -233,20 +255,21 @@ class DnsEngineRepository(private val context: Context) {
      * konstanta ukuran payload rata-rata iklan yang diblokir (Fase 3.4) —
      * BUKAN lagi angka acak `0.15-0.55` seperti simulasi lama.
      *
-     * CATATAN (batas Fase 3 vs Fase 4): `threatsPrevented` ikut dihitung
-     * di sini untuk domain berkategori [BlocklistEngine.CATEGORY_MALWARE_GUARD]
-     * yang diblokir, karena itu bagian dari `ProtectionStats` yang harus
-     * mencerminkan data nyata. Namun pencatatan detail ke tabel
-     * `threat_events` + notifikasi push TETAP tugas Fase 4 (deteksi
-     * ancaman nyata & transparansi klaim "AI Guard") — lihat
-     * `triggerThreatSimulationAlert()` yang belum diubah di fase ini.
+     * CATATAN (batas Fase 3 vs Fase 4, dikoreksi audit 2026-08-08):
+     * `threatsPrevented` ikut dihitung di sini untuk domain berkategori
+     * malware_guard/phishing_guard/fingerprint_guard/gambling_scam_ads
+     * yang diblokir. Pencatatan detail ke tabel `threat_events` +
+     * notifikasi push dilakukan oleh [recordRealThreatEvent] di bawah
+     * (Fase 4 — fungsi lama `triggerThreatSimulationAlert()` sudah
+     * dihapus total sejak Fase 4.1, bukan sekadar "belum diubah").
      */
     private suspend fun persistDnsQueryEvent(event: DnsQueryEvent) {
         val clientLabel = event.clientHint.ifBlank { "Trafik Perangkat (VPN)" }
         val isThreat = event.isBlocked && (
             event.category == BlocklistEngine.CATEGORY_MALWARE_GUARD ||
             event.category == BlocklistEngine.CATEGORY_PHISHING_GUARD ||
-            event.category == BlocklistEngine.CATEGORY_FINGERPRINT_GUARD
+            event.category == BlocklistEngine.CATEGORY_FINGERPRINT_GUARD ||
+            event.category == BlocklistEngine.CATEGORY_GAMBLING_SCAM_ADS
         )
 
         dao.insertDnsLog(
@@ -274,13 +297,13 @@ class DnsEngineRepository(private val context: Context) {
             avgLatencyMs = ((_stats.value.avgLatencyMs * 4 + event.latencyMs.toInt()) / 5)
         )
 
-        // Fase 4.1/4.3: deteksi ancaman NYATA. Sebelumnya threat_events &
-        // notifikasi hanya terisi lewat triggerThreatSimulationAlert() (domain
-        // acak + tombol manual). Sekarang setiap query yang benar-benar
-        // diblokir BlocklistEngine dengan kategori malware_guard langsung
-        // dicatat sebagai ThreatEventEntity nyata + notifikasi push nyata,
-        // tanpa keterlibatan random/tombol simulasi apa pun. Lihat
-        // RENCANA_PRODUKSI_NETSHIELD.md §Fase 4.
+        // Fase 4.1/4.3: deteksi ancaman NYATA sepenuhnya otomatis — setiap
+        // query yang benar-benar diblokir BlocklistEngine dengan kategori
+        // ancaman (malware/phishing/fingerprint/gambling-scam) langsung
+        // dicatat sebagai ThreatEventEntity nyata + notifikasi push nyata.
+        // (Fungsi lama triggerThreatSimulationAlert() sudah tidak ada sama
+        // sekali di codebase ini — dikonfirmasi lewat audit kode langsung,
+        // bukan hanya klaim dokumentasi.)
         if (isThreat) {
             recordRealThreatEvent(domain = event.domain, category = event.category, clientLabel = clientLabel)
         }
@@ -297,6 +320,8 @@ class DnsEngineRepository(private val context: Context) {
                 Pair("Phishing Guard", "Query DNS ke domain terdaftar di database phishing aktif berhasil dicegah sebelum resolusi.")
             BlocklistEngine.CATEGORY_FINGERPRINT_GUARD ->
                 Pair("Anti-Fingerprinting Guard", "Upaya tracker melakukan device fingerprinting & profiling identitas HP berhasil diblokir.")
+            BlocklistEngine.CATEGORY_GAMBLING_SCAM_ADS ->
+                Pair("Judi & Investasi Palsu", "Iklan/domain judi online atau investasi-trading palsu (mis. meniru platform resmi) berhasil dicegah sebelum resolusi.")
             else ->
                 Pair("Malware Guard", "Query DNS ke domain terdaftar di database malware & trojan (URLhaus) berhasil dicegah sebelum resolusi.")
         }
@@ -486,9 +511,10 @@ class DnsEngineRepository(private val context: Context) {
     /**
      * Fase 3.1: hanya menjalankan `uptimeJob` (jam aktif proteksi — data ini
      * memang selalu "real time" sejak dulu, bukan simulasi). Generator query
-     * acak (`simulationJob` lama) SUDAH DIHAPUS dari sini — data dnsLogs/stats
-     * produksi sekarang murni dari [recordDnsQueryResolved] (trafik nyata
-     * VpnService). Lihat [enableDebugSimulation] untuk mode testing UI.
+     * acak (`simulationJob` lama) SUDAH DIHAPUS TOTAL dari sini — data
+     * dnsLogs/stats produksi sekarang murni dari [recordDnsQueryResolved]
+     * (trafik nyata VpnService). Dikoreksi audit 2026-08-08: TIDAK ADA mode
+     * debug simulasi pengganti (lihat catatan di §Fase 3.5).
      */
     private fun startEngine() {
         if (uptimeJob?.isActive == true) return
@@ -550,13 +576,13 @@ class DnsEngineRepository(private val context: Context) {
     }
 
     /**
-     * Membatalkan seluruh coroutine milik repository ini (termasuk
-     * uptimeJob & debugSimulationJob jika aktif). Hanya dipanggil saat
-     * proses aplikasi benar-benar berakhir (mis. dari Application.onTerminate
-     * saat testing), TIDAK dari ViewModel.onCleared(), karena repository ini
-     * singleton yang harus tetap hidup selama aplikasi berjalan agar
-     * proteksi bisa terus berjalan di background walau layar/Activity
-     * ditutup.
+     * Membatalkan seluruh coroutine milik repository ini (uptimeJob dan
+     * seluruh child job lain di bawah [scope], termasuk collector
+     * dnsQueryEvents). Hanya dipanggil saat proses aplikasi benar-benar
+     * berakhir (mis. dari Application.onTerminate saat testing), TIDAK
+     * dari ViewModel.onCleared(), karena repository ini singleton yang
+     * harus tetap hidup selama aplikasi berjalan agar proteksi bisa terus
+     * berjalan di background walau layar/Activity ditutup.
      */
     fun close() {
         stopEngine()
