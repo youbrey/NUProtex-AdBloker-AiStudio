@@ -5,8 +5,10 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -15,15 +17,24 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Relay UDP non-DNS (Fase 1.7): trafik selain port 53 (mis. QUIC/HTTP3,
- * game online, dsb.) di-relay apa adanya lewat socket ter-protect() supaya
- * internet tetap jalan normal, TANPA filtering/inspeksi konten.
- *
- * Session di-key oleh (srcPort klien, dstIp, dstPort) dan otomatis ditutup
- * setelah [SESSION_IDLE_TIMEOUT_MS] tidak ada aktivitas.
+ * Relay UDP non-DNS: trafik selain port 53 (mis. QUIC/HTTP3 — dipakai
+ * YouTube/Instagram/TikTok, game online, dsb.) di-relay apa adanya lewat
+ * socket ter-protect() TANPA filtering/inspeksi konten.
  *
  * === CHANGELOG ===
  * [Fase 1 - 2026-08-07] Baru dibuat.
+ * [Audit - 2026-08-08] Perbaikan performa (bagian dari audit "video/reels
+ * sangat lambat"): `onOutboundPacket` sebelumnya membuat `scope.launch()`
+ * BARU untuk setiap paket UDP keluar. Di saat trafik video (QUIC) sangat
+ * padat (ratusan-ribuan paket/detik per sesi), ini membebani scheduler
+ * Dispatchers.IO yang dipakai bersama seluruh sesi TCP/UDP/DNS lain,
+ * menambah latensi terasa di semua trafik sekaligus. Sekarang memakai pola
+ * yang sama dengan `TcpNatManager`: satu `outboundChannel` FIFO + satu
+ * writer coroutine per sesi, `onOutboundPacket` hanya `trySend()` (murah,
+ * non-blocking, tidak membuat coroutine baru per paket).
+ * Catatan: UDP secara inheren tidak menjamin urutan di jaringan nyata,
+ * jadi perbaikan ini murni soal EFISIENSI (mengurangi overhead scheduler),
+ * bukan soal korupsi data seperti pada kasus TCP.
  */
 class UdpNatManager(
     private val vpnService: VpnService,
@@ -38,8 +49,10 @@ class UdpNatManager(
         val clientPort: Int,
         val remoteIp: ByteArray,
         val remotePort: Int,
-        var readerJob: Job? = null
+        var readerJob: Job? = null,
+        var writerJob: Job? = null
     ) {
+        val outboundChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
         @Volatile var lastActive: Long = System.currentTimeMillis()
     }
 
@@ -54,7 +67,7 @@ class UdpNatManager(
     private fun startSweeper() {
         sweeperJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
-                kotlinx.coroutines.delay(SWEEPER_INTERVAL_MS)
+                delay(SWEEPER_INTERVAL_MS)
                 cleanupExpiredSessions()
             }
         }
@@ -62,9 +75,7 @@ class UdpNatManager(
 
     private fun cleanupExpiredSessions() {
         val now = System.currentTimeMillis()
-        val expired = sessions.filter { (_, session) ->
-            now - session.lastActive > SESSION_IDLE_TIMEOUT_MS
-        }
+        val expired = sessions.filter { (_, session) -> now - session.lastActive > SESSION_IDLE_TIMEOUT_MS }
         expired.keys.forEach { closeSession(it) }
     }
 
@@ -87,20 +98,18 @@ class UdpNatManager(
             val existing = sessions.putIfAbsent(key, session)
             if (existing != null) {
                 // Sesi dibuat bersamaan oleh thread lain -> tutup socket duplikat
+                session.outboundChannel.close()
+                session.readerJob?.cancel()
+                session.writerJob?.cancel()
                 try { session.socket.close() } catch (_: Exception) {}
                 session = existing
             }
         }
         session.lastActive = System.currentTimeMillis()
 
-        scope.launch(Dispatchers.IO) {
-            try {
-                val addr = InetAddress.getByAddress(session.remoteIp)
-                session.socket.send(DatagramPacket(payload, payload.size, addr, session.remotePort))
-            } catch (e: Exception) {
-                Log.w(TAG, "Gagal kirim UDP relay ke $dstIpStr:${udp.dstPort}: ${e.message}")
-                closeSession(key)
-            }
+        val result = session.outboundChannel.trySend(payload)
+        if (result.isFailure) {
+            Log.w(TAG, "Gagal antre payload UDP untuk $key")
         }
     }
 
@@ -120,10 +129,27 @@ class UdpNatManager(
                 remotePort = udp.dstPort
             )
             session.readerJob = scope.launch(Dispatchers.IO) { readLoop(key, session) }
+            session.writerJob = scope.launch(Dispatchers.IO) { writerLoop(session) }
             session
         } catch (e: Exception) {
             Log.w(TAG, "Gagal membuat UDP NAT session: ${e.message}")
             null
+        }
+    }
+
+    private suspend fun writerLoop(session: Session) = withContext(Dispatchers.IO) {
+        try {
+            val addr = InetAddress.getByAddress(session.remoteIp)
+            for (payload in session.outboundChannel) {
+                try {
+                    session.socket.send(DatagramPacket(payload, payload.size, addr, session.remotePort))
+                } catch (e: Exception) {
+                    Log.w(TAG, "Gagal kirim UDP relay: ${e.message}")
+                    break
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "UDP writerLoop berhenti: ${e.message}")
         }
     }
 
@@ -160,7 +186,9 @@ class UdpNatManager(
 
     private fun closeSession(key: SessionKey) {
         sessions.remove(key)?.let {
+            it.outboundChannel.close()
             it.readerJob?.cancel()
+            it.writerJob?.cancel()
             try { it.socket.close() } catch (_: Exception) {}
         }
     }

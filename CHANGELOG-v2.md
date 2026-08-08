@@ -769,3 +769,57 @@ kosong, tidak dilewati apa pun.
 7. Uji stabilitas: biarkan VPN aktif beberapa jam sambil dipakai normal,
    pastikan tidak crash/force-close & tidak ada penurunan performa
    progresif (indikasi leak di NAT session).
+
+---
+
+## [Audit Performa Lanjutan] — 2026-08-08 — Fix Race Condition TCP Diterapkan (Konteks Fase 6.10)
+
+### Konteks
+Audit performa sebelumnya (lihat entri "[Audit Performa]" di atas — perlu
+dicari di riwayat/versi CHANGELOG terpisah bila entri itu tidak ada di
+sini) menemukan race condition kritis di `TcpNatManager.handleData()`.
+Perbaikannya baru sempat diterapkan ke salinan source code yang TERNYATA
+sudah usang — user sempat salah unggah file lama. Ini menerapkan fix yang
+SAMA ke source code yang benar-benar terbaru (yang sudah berisi perbaikan
+Fase 6.10: routing catch-all).
+
+### Kenapa Ini Sekarang Lebih Kritis Dari Sebelum Diperkirakan
+Fase 6.10 mengubah `Builder` VPN dari whitelist IP DNS sempit
+(`addRoute("1.1.1.1",32)` dkk.) menjadi catch-all
+(`addRoute("0.0.0.0",0)` + `addRoute("::",0)`). Ini FIX YANG BENAR untuk
+masalah "0% trafik masuk tun" yang ditemukan di device fisik — TAPI
+konsekuensinya, race condition penulisan TCP di `TcpNatManager` yang
+sebelumnya "hanya" berdampak ke trafik DoH/DoT (masih signifikan, tapi
+terbatas) sekarang berdampak ke **SELURUH koneksi TCP semua aplikasi**,
+termasuk semua request video/gambar/API dari Instagram/TikTok/YouTube.
+Ini menjelaskan mengapa keluhan "internet lambat saat streaming"
+kemungkinan terasa LEBIH parah setelah Fase 6.10 dibanding sebelumnya,
+walau Fase 6.10 sendiri adalah perbaikan yang tepat dan perlu.
+
+### Fix yang Diterapkan (identik dengan audit performa sebelumnya)
+- `TcpNatManager.kt`: penulisan ke socket upstream dipindah dari
+  "coroutine baru per paket" (urutan tidak terjamin, byte bisa terbalik,
+  merusak TLS/HTTP2) menjadi `outboundChannel` FIFO + satu `writerLoop`
+  per sesi (urutan terjamin). `socket.tcpNoDelay = true` ditambahkan.
+  State machine sesi (`CLOSE_WAIT`/`LAST_ACK`/`TIME_WAIT`) dilengkapi,
+  `evictOldestIfFull()` memprioritaskan sesi non-aktif dulu.
+- `UdpNatManager.kt`: pola channel+writer yang sama diterapkan (murni
+  efisiensi scheduler untuk trafik QUIC padat).
+
+### File Diubah
+- ✏️ `TcpNatManager.kt`
+- ✏️ `UdpNatManager.kt`
+
+### Status Verifikasi
+- [ ] **BELUM diuji di device fisik.** Prioritas pengujian sekarang GANDA:
+  1. Konfirmasi Fase 6.10 (catch-all routing) benar-benar membuat
+     `PacketTunnel` menerima semua trafik (cek Logcat `PacketTunnel`,
+     harus ramai untuk semua jenis trafik, bukan cuma port 53).
+  2. Ulangi uji reels/video/stories dari audit performa sebelumnya —
+     seharusnya sekarang jauh lebih mulus karena (a) trafiknya memang
+     masuk tunnel [Fase 6.10] DAN (b) tidak lagi rusak urutan tulisnya
+     [fix TcpNatManager/UdpNatManager].
+  3. Perhatikan juga battery/CPU usage: catch-all routing berarti
+     `TcpNatManager`/`UdpNatManager` sekarang menangani jauh lebih banyak
+     sesi paralel dari sebelumnya (dulu cuma DoH/DoT) — `MAX_SESSIONS=500`
+     per manager sebaiknya dipantau apakah cukup saat penggunaan berat.
