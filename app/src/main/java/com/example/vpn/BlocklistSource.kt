@@ -100,6 +100,32 @@ object BlocklistSource {
     private const val HAGEZI_NATIVE_TIKTOK =
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/native.tiktok.extended.txt"
 
+    // ---- Sumber BARU Audit-8 (diminta user, dari lampiran repo HaGeZi) ----
+    // "social.txt" SENGAJA TIDAK didaftarkan di sini — isinya memblokir
+    // SELURUH platform sosial (Facebook/Instagram/TikTok/dst.), bukan
+    // sekadar tracker-nya. Bertentangan langsung dengan instruksi user
+    // ("jangan memblokir API utama Facebook/WhatsApp/Instagram/TikTok").
+    // "spam-tlds.txt" JUGA TIDAK didaftarkan — memakai sintaks wildcard TLD
+    // (`||*.tld^$denyallow=...`) yang tidak didukung parseHostsFile() saat
+    // ini (akan tersimpan sebagai literal "*.tld" yang tidak pernah cocok
+    // domain nyata apa pun — no-op senyap). Perlu implementasi matcher
+    // wildcard+denyallow terpisah sebelum bisa diaktifkan, dicatat sebagai
+    // kerja lanjutan di CHANGELOG-v2.md §Audit-8.
+    private const val HAGEZI_ANTI_PIRACY =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/anti.piracy.txt"
+    private const val HAGEZI_ULTIMATE =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/ultimate.txt"
+    private const val HAGEZI_MULTI =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/multi.txt"
+    private const val HAGEZI_GAMBLING_MEDIUM =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/gambling.medium.txt"
+    private const val HAGEZI_NATIVE_XIAOMI =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/native.xiaomi.txt"
+    private const val HAGEZI_URLSHORTENER =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/urlshortener.txt"
+    private const val HAGEZI_DOH_VPN_PROXY_BYPASS =
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/doh-vpn-proxy-bypass.txt"
+
     /** Semua sumber yang perlu diunduh. Satu kategori bisa punya >1 sumber (digabung saat load). */
     val ALL_SOURCES: List<Source> = listOf(
         Source("malware_guard", URLHAUS_HOSTFILE, "urlhaus_hostfile"),
@@ -133,7 +159,23 @@ object BlocklistSource {
         // BARU Fase 2.7 — langsung menjawab kasus nyata Fandri (iklan judi
         // NX888 & iklan trading kripto palsu ala Binance).
         Source("gambling_scam_ads", HAGEZI_GAMBLING, "hagezi_gambling"),
-        Source("gambling_scam_ads", HAGEZI_FAKE, "hagezi_fake")
+        Source("gambling_scam_ads", HAGEZI_FAKE, "hagezi_fake"),
+        // BARU Audit-8 — varian "medium" gambling.txt, cakupan lebih luas.
+        Source("gambling_scam_ads", HAGEZI_GAMBLING_MEDIUM, "hagezi_gambling_medium"),
+
+        // BARU Audit-8 (lihat komentar HAGEZI_ANTI_PIRACY dkk. di atas
+        // untuk daftar yang SENGAJA tidak didaftarkan & alasannya).
+        Source("anti_piracy", HAGEZI_ANTI_PIRACY, "hagezi_anti_piracy"),
+        Source("url_shortener_guard", HAGEZI_URLSHORTENER, "hagezi_urlshortener"),
+        // multi.txt & ultimate.txt: list umum HaGeZi paling komprehensif,
+        // otomatis dilindungi ESSENTIAL_ALLOWLIST di BlocklistEngine
+        // (keduanya terverifikasi berisi graph.facebook.com/graph.instagram.com/
+        // graph.whatsapp.com/gateway.instagram.com — lihat CHANGELOG-v2.md §Audit-8).
+        Source("trackers", HAGEZI_MULTI, "hagezi_multi"),
+        Source("trackers", HAGEZI_ULTIMATE, "hagezi_ultimate"),
+        Source("trackers", HAGEZI_NATIVE_XIAOMI, "hagezi_native_xiaomi"),
+        // Default filter OFF (lihat FilterOption.kt) — user harus aktifkan manual.
+        Source("doh_bypass_guard", HAGEZI_DOH_VPN_PROXY_BYPASS, "hagezi_doh_vpn_proxy_bypass")
     )
 
     /** Kategori unik yang dikenal — dipakai untuk inisialisasi struktur kosong sebelum load pertama. */
