@@ -56,6 +56,30 @@ import java.util.concurrent.atomic.AtomicInteger
  *    `CLOSING` dan berisiko meng-evict sesi video yang masih aktif lewat
  *    `evictOldestIfFull()`).
  *  Lihat CHANGELOG.md untuk detail lengkap.
+ * [Audit-2 - 2026-08-08] **BUG KRITIS ditemukan lewat audit kode** (laporan:
+ * "internet lambat saat browsing/game/nonton video/reels" setelah Fase 6.10
+ * mengalihkan SEMUA trafik TCP lewat NAT relay ini):
+ *  - Root cause: SYN-ACK sintetis di `handleSyn()` dibangun tanpa opsi TCP
+ *    apa pun (MSS/Window Scale) — `NetPacketUtils.buildIpv4TcpPacket` lama
+ *    selalu membuat header 20-byte polos. Akibatnya:
+ *    1. Window Scaling MATI TOTAL untuk seluruh umur setiap koneksi (RFC
+ *       1323 mewajibkan opsi WS ada di SYN *dan* SYN-ACK) — window terkunci
+ *       maks 65535 byte, membatasi throughput per-koneksi ke `window/RTT`
+ *       (bisa serendah 3-6 Mbps di jaringan seluler ber-RTT tinggi),
+ *       walau bandwidth asli jauh lebih besar.
+ *    2. MSS tidak dinegosiasikan -> klien fallback ke default RFC 879 lama
+ *       (536 byte, bukan ~1460), memperbanyak jumlah paket ~2.7x dan
+ *       memperlambat slow-start (yang tumbuh per-RTT dalam satuan segmen).
+ *  - Fix: `NetPacketUtils.parseTcpHeader` kini membaca opsi MSS/Window
+ *    Scale dari SYN klien; `buildSynAckOptions()` baru menyusun opsi balik
+ *    (MSS diclamp ke `MAX_SEGMENT_SIZE`, Window Scale HANYA disertakan jika
+ *    klien memintanya, sesuai RFC). `windowFieldFor()` menerapkan shift
+ *    window secara konsisten di semua segmen (data & kontrol) sepanjang
+ *    umur sesi.
+ *  Lihat CHANGELOG.md & DOKUMENTASI.md untuk detail & keterbatasan yang
+ *  masih ada (mis. arah server->client belum benar-benar membaca window
+ *  yang diiklankan klien untuk flow control adaptif — lihat catatan di
+ *  CHANGELOG.md §Audit-2).
  */
 class TcpNatManager(
     private val vpnService: VpnService,
@@ -91,6 +115,9 @@ class TcpNatManager(
         // server->client) masing-masing satu coroutine per sesi -> aman tanpa lock tambahan.
         @Volatile var serverSeq: Long = INITIAL_SERVER_SEQ
         @Volatile var clientNextSeq: Long = 0L // byte berikutnya yang kita harapkan dari klien
+        // Fase Audit-2: true jika klien menyertakan opsi Window Scale di SYN-nya
+        // (RFC 1323 — WS hanya boleh diaktifkan jika ADA di SYN *dan* SYN-ACK).
+        @Volatile var windowScaleEnabled: Boolean = false
         var readerJob: Job? = null
         var writerJob: Job? = null
         // FIFO — menjamin byte ditulis ke socket upstream PERSIS urutan kedatangan dari klien.
@@ -188,14 +215,31 @@ class TcpNatManager(
                     remotePort = tcp.dstPort
                 )
                 session.clientNextSeq = (tcp.seq + 1) and 0xFFFFFFFFL
+                // Fase Audit-2 (BUG KRITIS diperbaiki): sebelumnya SYN-ACK sintetis
+                // TIDAK PERNAH menyertakan opsi MSS/Window Scale, memaksa TCP stack
+                // klien fallback ke MSS 536 byte & window scaling MATI TOTAL untuk
+                // seluruh umur koneksi (RFC 1323: WS harus ada di SYN *dan* SYN-ACK).
+                // Ini membatasi throughput per-koneksi ke ~window/RTT (bisa serendah
+                // 3-6 Mbps di jaringan seluler), persis gejala video/reels buffering
+                // & game lag yang dilaporkan. Sekarang: MSS diclamp ke MAX_SEGMENT_SIZE,
+                // dan Window Scale ikut dibalas HANYA jika klien memang memintanya di
+                // SYN (tcp.clientSupportsWindowScale) — sesuai RFC, bukan asal aktifkan.
+                session.windowScaleEnabled = tcp.clientSupportsWindowScale
+                val synAckOptions = NetPacketUtils.buildSynAckOptions(
+                    mss = MAX_SEGMENT_SIZE,
+                    includeWindowScale = session.windowScaleEnabled,
+                    windowScaleShift = SERVER_WINDOW_SCALE_SHIFT
+                )
+
                 sessions[key] = session
 
-                // Kirim SYN-ACK sintetis ke klien.
+                // Kirim SYN-ACK sintetis ke klien (kini menyertakan opsi TCP di atas).
                 sendControlSegment(
                     session, key,
                     flags = NetPacketUtils.TCP_FLAG_SYN or NetPacketUtils.TCP_FLAG_ACK,
                     seqOverride = session.serverSeq,
-                    ackOverride = session.clientNextSeq
+                    ackOverride = session.clientNextSeq,
+                    options = synAckOptions
                 )
                 session.serverSeq = (session.serverSeq + 1) and 0xFFFFFFFFL
                 session.state = State.ESTABLISHED
@@ -311,7 +355,7 @@ class TcpNatManager(
             seq = session.serverSeq,
             ack = session.clientNextSeq,
             flags = NetPacketUtils.TCP_FLAG_PSH or NetPacketUtils.TCP_FLAG_ACK,
-            window = DEFAULT_WINDOW,
+            window = windowFieldFor(session),
             payload = payload,
             identification = identification.getAndIncrement()
         )
@@ -324,7 +368,8 @@ class TcpNatManager(
         key: SessionKey,
         flags: Int,
         seqOverride: Long? = null,
-        ackOverride: Long? = null
+        ackOverride: Long? = null,
+        options: ByteArray = ByteArray(0)
     ) {
         val packet = NetPacketUtils.buildIpv4TcpPacket(
             srcIp = session.remoteIp,
@@ -334,11 +379,30 @@ class TcpNatManager(
             seq = seqOverride ?: session.serverSeq,
             ack = ackOverride ?: session.clientNextSeq,
             flags = flags,
-            window = DEFAULT_WINDOW,
+            window = windowFieldFor(session),
             payload = ByteArray(0),
-            identification = identification.getAndIncrement()
+            identification = identification.getAndIncrement(),
+            options = options
         )
         writeToTun(packet)
+    }
+
+    /**
+     * Field window 16-bit yang ditulis ke wire. Fase Audit-2: jika Window
+     * Scale dinegosiasikan (lihat [handleSyn]), window "asli" yang kita
+     * iklankan ([ADVERTISED_WINDOW_BYTES], beberapa MB) di-shift kanan
+     * sejumlah [SERVER_WINDOW_SCALE_SHIFT] sebelum ditulis ke field 16-bit
+     * (sesuai RFC 1323). Jika klien tidak mendukung WS, tetap pakai
+     * [DEFAULT_WINDOW] (65535) polos seperti sebelumnya — WAJIB, karena
+     * mengirim window scaling tanpa negosiasi akan disalahartikan klien
+     * sebagai window 16-bit biasa yang sangat kecil/aneh.
+     */
+    private fun windowFieldFor(session: Session): Int {
+        return if (session.windowScaleEnabled) {
+            (ADVERTISED_WINDOW_BYTES shr SERVER_WINDOW_SCALE_SHIFT).coerceIn(0, 65535)
+        } else {
+            DEFAULT_WINDOW
+        }
     }
 
     private fun closeSession(key: SessionKey, sendRst: Boolean) {
@@ -374,5 +438,13 @@ class TcpNatManager(
         private const val IDLE_TRANSIENT_TIMEOUT_MS = 15_000L // 15 detik
         private const val TIME_WAIT_LINGER_MS = 2_000L
         private const val MAX_SESSIONS = 500
+        // Fase Audit-2: shift Window Scale yang KITA tawarkan ke klien (nilai
+        // umum dipakai OS modern, mis. Linux/Android sering pakai 6-9). Window
+        // asli yang bisa diiklankan = ADVERTISED_WINDOW_BYTES (di-shift kanan
+        // shift ini sebelum ditulis ke field 16-bit wire).
+        private const val SERVER_WINDOW_SCALE_SHIFT = 6
+        // ~4 MB — jauh di atas batas 64KB lama, memungkinkan throughput tinggi
+        // di link berlatensi lebih tinggi (video/reels/game di jaringan seluler).
+        private const val ADVERTISED_WINDOW_BYTES = 65535 shl SERVER_WINDOW_SCALE_SHIFT
     }
 }

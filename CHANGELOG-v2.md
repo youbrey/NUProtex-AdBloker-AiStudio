@@ -823,3 +823,78 @@ walau Fase 6.10 sendiri adalah perbaikan yang tepat dan perlu.
      `TcpNatManager`/`UdpNatManager` sekarang menangani jauh lebih banyak
      sesi paralel dari sebelumnya (dulu cuma DoH/DoT) — `MAX_SESSIONS=500`
      per manager sebaiknya dipantau apakah cukup saat penggunaan berat.
+
+---
+
+## [Audit-2] — 2026-08-08 — Perbaikan Bug Kritis: Internet Lambat (Browsing/Game/Video)
+
+### Laporan Awal
+Setelah Fase 6.10 (routing catch-all `0.0.0.0/0`), seluruh trafik non-DNS
+melewati `TcpNatManager`/`UdpNatManager`. User melaporkan koneksi internet
+terasa lambat saat browsing, main game, dan menonton video/reels/story.
+
+### Root Cause (ditemukan lewat audit kode, bukan simulasi)
+`TcpNatManager.handleSyn()` membangun balasan SYN-ACK sintetis lewat
+`NetPacketUtils.buildIpv4TcpPacket()` — versi lama fungsi ini SELALU
+menghasilkan header TCP 20-byte polos, tanpa opsi MSS maupun Window Scale
+apa pun, dan `parseTcpHeader()` juga tidak pernah membaca opsi dari SYN
+klien. Dampak, untuk **setiap** koneksi TCP yang direlay:
+
+1. **Window Scaling mati total.** RFC 1323 mewajibkan opsi Window Scale
+   ada di SYN *dan* SYN-ACK supaya aktif untuk koneksi tersebut. Karena
+   SYN-ACK kita tidak pernah menyertakannya, window klien terkunci maksimal
+   65535 byte sepanjang umur koneksi — throughput per koneksi dibatasi
+   `window ÷ RTT`. Di jaringan seluler dengan RTT 80-150ms, ini bisa
+   serendah ~3-6 Mbps per koneksi walau bandwidth asli jauh lebih besar —
+   persis gejala buffering video/reels & lag game yang dilaporkan.
+2. **MSS tidak dinegosiasikan.** Tanpa opsi MSS di SYN-ACK, klien fallback
+   ke default RFC 879 lama (536 byte, bukan ~1460), memperbanyak jumlah
+   paket ~2.7x dan memperlambat slow-start (yang tumbuh per-RTT dalam
+   satuan segmen, bukan byte) — terasa di setiap koneksi baru (gambar,
+   API call, asset game, segmen video).
+
+### Perbaikan
+- `NetPacketUtils.kt`
+  - `TcpHeader` ditambah `clientMss`/`clientSupportsWindowScale`, diisi
+    `parseTcpHeader()` lewat parser opsi TCP baru (`parseTcpOptions`) —
+    hanya dijalankan untuk paket SYN.
+  - `buildSynAckOptions()` baru: menyusun opsi balik (MSS diclamp ke
+    `MAX_SEGMENT_SIZE`=1400, Window Scale HANYA disertakan jika klien
+    memintanya di SYN — sesuai RFC, bukan asal aktifkan).
+  - `buildIpv4TcpPacket()` menerima parameter `options` opsional (default
+    kosong, tidak mengubah perilaku paket data/kontrol biasa).
+- `TcpNatManager.kt`
+  - `Session.windowScaleEnabled` menyimpan hasil negosiasi per sesi.
+  - `handleSyn()` menyertakan opsi TCP di SYN-ACK.
+  - `windowFieldFor()` baru: menulis window ter-shift (`ADVERTISED_WINDOW_BYTES
+    shr SERVER_WINDOW_SCALE_SHIFT`, ~4MB nyata) bila WS aktif, atau tetap
+    65535 polos bila klien tidak mendukungnya — diterapkan konsisten di
+    `sendDataSegment()` & `sendControlSegment()`.
+
+### Status Verifikasi
+- [x] Perbaikan kode selesai, konsisten dengan RFC 1323 (WS hanya aktif
+  bila diminta klien) & RFC 879 (MSS dinegosiasikan, bukan asal besar).
+- [ ] **BELUM diverifikasi** dengan pengukuran throughput nyata di device
+  fisik (mis. speedtest sebelum/sesudah, atau `tcpdump`/Wireshark capture
+  untuk memastikan opsi TCP di SYN-ACK benar-benar terbaca stack Android
+  sebagai valid). Wajib dilakukan Fandri sebelum menganggap bug ini
+  benar-benar tuntas.
+
+### Keterbatasan yang Masih Ada (transparan, belum ditangani audit ini)
+- **Flow control server→klien masih "buta".** `readLoop()` mengirim semua
+  data yang dibaca dari socket upstream langsung ke klien tanpa pernah
+  membaca window yang benar-benar diiklankan klien di paket ACK masuk
+  (window di paket ACK klien diabaikan sepenuhnya). Ini beda dari flow
+  control "sesungguhnya" TCP — client tidak bisa benar-benar menekan laju
+  kirim server via window kecil. Risiko: pada koneksi sangat lambat di
+  sisi klien, ini bisa menyebabkan overrun buffer. Perbaikan penuh
+  memerlukan sliding-window tracking dua arah — di luar cakupan audit ini,
+  direkomendasikan masuk backlog Fase 7 (QA/hardening).
+- **`writeToTun()` di `PacketTunnel` memakai satu lock global** yang
+  men-serialize SEMUA penulisan paket (TCP+UDP+DNS, lintas SEMUA sesi).
+  Ini tetap diperlukan untuk mencegah paket "robek"/tercampur di fd tun
+  (write() tun harus satu paket utuh per syscall), tapi jadi titik
+  kontensi saat sangat banyak sesi aktif bersamaan (browsing+game+video
+  sekaligus). Belum diubah di audit ini karena solusinya (mis. writer
+  queue per-tun dengan satu consumer, atau io_uring) perlu pengujian
+  beban tersendiri. Direkomendasikan masuk backlog Fase 7.

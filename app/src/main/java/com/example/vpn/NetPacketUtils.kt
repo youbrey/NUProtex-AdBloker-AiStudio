@@ -359,8 +359,45 @@ object NetPacketUtils {
         val flags: Int,
         val window: Int,
         val payloadOffset: Int,
-        val payloadLength: Int
+        val payloadLength: Int,
+        /** MSS yang diminta klien lewat opsi TCP di SYN (null jika tidak ada opsi/bukan SYN). Fase Audit-2. */
+        val clientMss: Int? = null,
+        /** true jika klien menyertakan opsi Window Scale (kind=3) di SYN — WAJIB dicek sebelum kita ikut membalas opsi WS, sesuai RFC 1323 (WS hanya aktif jika ADA di SYN *dan* SYN-ACK). Fase Audit-2. */
+        val clientSupportsWindowScale: Boolean = false
     )
+
+    /**
+     * Parse opsi TCP di belakang header 20-byte dasar (MSS, Window Scale)
+     * — HANYA relevan untuk paket SYN. Diabaikan untuk paket lain.
+     * (Fase Audit-2, lihat CHANGELOG.md "Bug Kritis: TCP MSS/Window Scale
+     * tidak dinegosiasikan".)
+     */
+    private fun parseTcpOptions(packet: ByteArray, tcpOffset: Int, dataOffset: Int): Pair<Int?, Boolean> {
+        var mss: Int? = null
+        var hasWindowScale = false
+        var pos = tcpOffset + 20
+        val end = tcpOffset + dataOffset
+        while (pos < end && pos < packet.size) {
+            val kind = packet[pos].toInt() and 0xFF
+            when (kind) {
+                0 -> break // End of Options List
+                1 -> pos += 1 // NOP, panjang 1 byte, tidak ada field length
+                else -> {
+                    if (pos + 1 >= packet.size) break
+                    val len = packet[pos + 1].toInt() and 0xFF
+                    if (len < 2 || pos + len > packet.size) break
+                    when (kind) {
+                        2 -> if (len == 4) { // MSS
+                            mss = ((packet[pos + 2].toInt() and 0xFF) shl 8) or (packet[pos + 3].toInt() and 0xFF)
+                        }
+                        3 -> hasWindowScale = true // Window Scale
+                    }
+                    pos += len
+                }
+            }
+        }
+        return mss to hasWindowScale
+    }
 
     fun parseTcpHeader(packet: ByteArray, offset: Int, totalLength: Int): TcpHeader? {
         if (totalLength - offset < 20) return null
@@ -374,7 +411,33 @@ object NetPacketUtils {
         val window = ((packet[offset + 14].toInt() and 0xFF) shl 8) or (packet[offset + 15].toInt() and 0xFF)
         val payloadOffset = offset + dataOffset
         val payloadLength = (totalLength - payloadOffset).coerceAtLeast(0)
-        return TcpHeader(srcPort, dstPort, seq, ack, dataOffset, flags, window, payloadOffset, payloadLength)
+
+        var clientMss: Int? = null
+        var clientSupportsWs = false
+        if ((flags and 0x02) != 0 && dataOffset > 20) { // SYN_FLAG=0x02, hanya parse opsi kalau ada opsi (dataOffset>20)
+            val (mss, ws) = parseTcpOptions(packet, offset, dataOffset)
+            clientMss = mss
+            clientSupportsWs = ws
+        }
+
+        return TcpHeader(srcPort, dstPort, seq, ack, dataOffset, flags, window, payloadOffset, payloadLength, clientMss, clientSupportsWs)
+    }
+
+    /**
+     * Bangun blok opsi TCP untuk SYN-ACK sintetis: MSS (diclamp ke [mss])
+     * + Window Scale (HANYA disertakan jika [includeWindowScale] true —
+     * yaitu klien memang meminta opsi ini di SYN-nya, sesuai RFC 1323).
+     * Total selalu kelipatan 4 byte (di-pad NOP bila perlu) — disyaratkan
+     * agar dataOffset (dalam satuan word 32-bit) valid.
+     */
+    fun buildSynAckOptions(mss: Int, includeWindowScale: Boolean, windowScaleShift: Int): ByteArray {
+        val mssOption = byteArrayOf(2, 4, ((mss shr 8) and 0xFF).toByte(), (mss and 0xFF).toByte())
+        if (!includeWindowScale) {
+            // 4 byte MSS saja, sudah kelipatan 4 -> tidak perlu padding.
+            return mssOption
+        }
+        // MSS(4) + NOP(1) + WScale(kind=3,len=3,shift)(3) = 8 byte, kelipatan 4.
+        return mssOption + byteArrayOf(1, 3, 3, windowScaleShift.toByte())
     }
 
     /** Membangun paket IPv4+TCP (dipakai TcpNatManager untuk balas SYN-ACK/ACK/data/FIN sintetis). */
@@ -388,9 +451,10 @@ object NetPacketUtils {
         flags: Int,
         window: Int,
         payload: ByteArray,
-        identification: Int
+        identification: Int,
+        options: ByteArray = EMPTY_OPTIONS
     ): ByteArray {
-        val tcpHeaderLength = 20
+        val tcpHeaderLength = 20 + options.size
         val tcpLength = tcpHeaderLength + payload.size
         val totalLength = 20 + tcpLength
         val out = ByteArray(totalLength)
@@ -410,6 +474,9 @@ object NetPacketUtils {
         tcpSegment[17] = 0
         tcpSegment[18] = 0 // urgent pointer
         tcpSegment[19] = 0
+        if (options.isNotEmpty()) {
+            System.arraycopy(options, 0, tcpSegment, 20, options.size)
+        }
         System.arraycopy(payload, 0, tcpSegment, tcpHeaderLength, payload.size)
 
         val checksum = transportChecksum(srcIp, dstIp, PROTOCOL_TCP, tcpSegment)
@@ -420,6 +487,8 @@ object NetPacketUtils {
         System.arraycopy(tcpSegment, 0, out, 20, tcpLength)
         return out
     }
+
+    private val EMPTY_OPTIONS = ByteArray(0)
 
     private fun readUInt32(data: ByteArray, offset: Int): Long {
         return ((data[offset].toLong() and 0xFF) shl 24) or
