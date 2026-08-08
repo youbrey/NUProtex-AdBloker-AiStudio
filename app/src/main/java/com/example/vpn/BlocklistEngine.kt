@@ -98,7 +98,15 @@ object BlocklistEngine {
         // Anti-Tracking, Telemetry & Analytics (trackers)
         "analytics.facebook.com" to "trackers",
         "telemetry.microsoft.com" to "trackers",
-        "graph.facebook.com" to "trackers",
+        // "graph.facebook.com" DIHAPUS (Audit-7 — BUG KRITIS): ini BUKAN
+        // domain tracker, melainkan Facebook Graph API — jalur yang dipakai
+        // aplikasi Facebook resmi untuk memuat Beranda & Reels. Sebelumnya
+        // diberi kategori "trackers" (default aktif), sehingga SETIAP query
+        // ke domain ini otomatis di-NXDOMAIN. Root cause laporan "Facebook
+        // gagal load Beranda, Reels blank total". Lihat ESSENTIAL_ALLOWLIST
+        // di bawah — domain sekelas ini sekarang dijaga permanen, tidak
+        // cukup hanya dihapus dari daftar ini (BlocklistStore hasil unduhan
+        // StevenBlack/HaGeZi berpotensi memuat ulang false-positive serupa).
         "an.facebook.com" to "trackers",
         "pixel.facebook.com" to "trackers",
         "app-measurement.com" to "trackers",
@@ -135,7 +143,7 @@ object BlocklistEngine {
         // Social Trackers (social_ads)
         "analytics.tiktok.com" to "social_ads",
         "log.tiktokv.com" to "social_ads",
-        "connect.facebook.net" to "social_ads",
+        // "connect.facebook.net" DIHAPUS dari sini (Audit-7) -> lihat ESSENTIAL_ALLOWLIST.
 
         // Malware & Phishing Guard (malware_guard / phishing_guard)
         "phish-login-bank-id.online" to "phishing_guard",
@@ -145,6 +153,51 @@ object BlocklistEngine {
         "malware-payload-installer.info" to "malware_guard",
         "ransomware-c2-server.top" to "malware_guard"
     )
+
+    /**
+     * Fase Audit-7: jaring pengaman permanen — domain API/CDN INTI yang
+     * WAJIB selalu boleh, apa pun kata sumber blocklist (baik
+     * SEED_BLOCKED_DOMAINS di atas maupun BlocklistStore hasil unduhan
+     * StevenBlack/HaGeZi/URLhaus). Dicek PALING AWAL, sebelum sumber
+     * blocklist mana pun, dan TIDAK bisa di-override oleh kategori filter
+     * mana pun (custom rule user tetap menang — lihat urutan prioritas di
+     * evaluate()).
+     *
+     * Kenapa perlu lapisan terpisah, bukan cukup dihapus dari
+     * SEED_BLOCKED_DOMAINS saja: root cause bug "Facebook Beranda/Reels
+     * gagal total" adalah `graph.facebook.com` (Graph API resmi, BUKAN
+     * tracker) sempat masuk SEED dengan kategori "trackers" (default
+     * aktif). Menghapusnya dari SEED saja tidak mencegah regresi serupa
+     * jika suatu saat BlocklistStore (daftar unduhan pihak ketiga, di luar
+     * kendali langsung kode ini) juga memuat domain sekelas ini — banyak
+     * daftar "anti-tracker" agresif publik memang punya riwayat salah
+     * mengklasifikasikan domain API inti sebagai tracker karena satu
+     * infrastruktur dipakai untuk keduanya (umum terjadi pada Meta/Google/
+     * TikTok CDN). Domain di sini sengaja dibatasi HANYA pada endpoint
+     * fungsional inti (memuat feed/reels/API), BUKAN pixel/SDK analytics
+     * (mis. `connect.facebook.net`, `analytics.tiktok.com` TETAP boleh
+     * diblokir kategori social_ads/trackers seperti biasa).
+     */
+    private val ESSENTIAL_ALLOWLIST: Set<String> = setOf(
+        // Facebook/Instagram/WhatsApp (Meta) — API inti pemuat konten.
+        "graph.facebook.com",
+        "graph.instagram.com",
+        "b-graph.facebook.com",
+        "gateway.facebook.com",
+        "edge-mqtt.facebook.com",
+        "video.xx.fbcdn.net",
+        "scontent.xx.fbcdn.net",
+        // TikTok — API inti pemuat feed video.
+        "api.tiktokv.com",
+        "api16-normal-c-useast1a.tiktokv.com",
+        // Anthropic/Claude — API inti aplikasi Claude.
+        "api.anthropic.com",
+        "claude.ai"
+    )
+
+    /** true jika [normalized] persis salah satu domain esensial, atau subdomain darinya. */
+    private fun isEssential(normalized: String): Boolean =
+        ESSENTIAL_ALLOWLIST.any { normalized == it || normalized.endsWith(".$it") }
 
     /** Kategori (filter id) yang termasuk indikasi ancaman keamanan — dipakai untuk notifikasi & log ancaman. */
     const val CATEGORY_MALWARE_GUARD = "malware_guard"
@@ -157,10 +210,14 @@ object BlocklistEngine {
 
     /**
      * Evaluasi keputusan blokir untuk [domain].
-     * Urutan prioritas (sesuai dokumentasi, Fase 2.4):
-     * 1. Custom rule user (blacklist/whitelist manual) SELALU menang atas apa pun.
-     * 2. BlocklistStore (blocklist nyata hasil unduhan, Fase 2.2-2.3).
-     * 3. SEED_BLOCKED_DOMAINS (fallback offline-pertama-kali).
+     * Urutan prioritas (Audit-7):
+     * 1. Custom rule user (blacklist/whitelist manual) SELALU menang atas apa pun
+     *    — termasuk atas ESSENTIAL_ALLOWLIST, supaya user power-user yang
+     *    SENGAJA ingin blokir salah satu domain di atas tetap bisa.
+     * 2. ESSENTIAL_ALLOWLIST — domain API/CDN inti yang tidak boleh diblokir
+     *    sumber blocklist mana pun (lihat dokumentasi di atas).
+     * 3. BlocklistStore (blocklist nyata hasil unduhan, Fase 2.2-2.3).
+     * 4. SEED_BLOCKED_DOMAINS (fallback offline-pertama-kali).
      */
     fun evaluate(
         domain: String,
@@ -179,14 +236,19 @@ object BlocklistEngine {
             return Decision(customMatch.isBlocked, customMatch.category)
         }
 
-        // 2. BlocklistStore (check domain and parent domain hierarchy)
+        // 2. Essential allowlist — lihat dokumentasi ESSENTIAL_ALLOWLIST di atas.
+        if (isEssential(normalized)) {
+            return Decision(isBlocked = false, category = "essential_allowlist")
+        }
+
+        // 3. BlocklistStore (check domain and parent domain hierarchy)
         val storeCategory = BlocklistStore.categoryFor(normalized)
         if (storeCategory != null) {
             val enabled = filterOptions.firstOrNull { it.id == storeCategory }?.isEnabled ?: true
             return Decision(enabled, storeCategory)
         }
 
-        // 3. Fallback SEED_BLOCKED_DOMAINS (check domain and parent domain hierarchy)
+        // 4. Fallback SEED_BLOCKED_DOMAINS (check domain and parent domain hierarchy)
         var curr = normalized
         while (curr.isNotEmpty()) {
             val seedCategory = SEED_BLOCKED_DOMAINS[curr]
