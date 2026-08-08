@@ -181,8 +181,12 @@ object BlocklistEngine {
     private val ESSENTIAL_ALLOWLIST: Set<String> = setOf(
         // Facebook/Instagram/WhatsApp (Meta) — API inti pemuat konten.
         "graph.facebook.com",
-        "graph.instagram.com",
         "b-graph.facebook.com",
+        "b-graph-fallback.facebook.com",
+        "z-m-graph.facebook.com",
+        "graph.instagram.com",
+        "gateway.instagram.com",
+        "graph.whatsapp.com",
         "gateway.facebook.com",
         "edge-mqtt.facebook.com",
         "video.xx.fbcdn.net",
