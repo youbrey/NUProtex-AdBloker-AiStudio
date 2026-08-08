@@ -118,10 +118,18 @@ class PacketTunnel(
 
     private val tunnelScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var packetLoopJob: Job? = null
+    private var icmpNotifySweeperJob: Job? = null
     private val identificationCounter = AtomicInteger(1)
 
     private val udpNat = UdpNatManager(vpnService, tunnelScope) { data -> writeToTun(data) }
     private val tcpNat = TcpNatManager(vpnService, tunnelScope) { data -> writeToTun(data) }
+
+    // Fase Audit-6: dedupe key untuk balasan ICMPv6 Port Unreachable (lihat
+    // handlePacket cabang IPv6 UDP) — WAJIB, lihat dokumentasi bug kritis di
+    // atas kelas ini. Key = (srcPort klien, dstIp tujuan, dstPort tujuan),
+    // value = waktu terakhir kali kita membalas ICMP untuk kombinasi ini.
+    private data class Ipv6UdpNotifyKey(val srcPort: Int, val dstIp: String, val dstPort: Int)
+    private val ipv6UdpIcmpNotified = java.util.concurrent.ConcurrentHashMap<Ipv6UdpNotifyKey, Long>()
 
     @Volatile private var outputStream: FileOutputStream? = null
     private val writeLock = Any()
@@ -132,6 +140,17 @@ class PacketTunnel(
         val input = FileInputStream(vpnInterface.fileDescriptor)
         val output = FileOutputStream(vpnInterface.fileDescriptor)
         outputStream = output
+
+        // Fase Audit-6: bersihkan entri dedupe ICMPv6 kadaluarsa secara
+        // berkala — lihat dokumentasi `ipv6UdpIcmpNotified` & konstanta
+        // ICMP_NOTIFY_SWEEP_INTERVAL_MS.
+        icmpNotifySweeperJob = tunnelScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(ICMP_NOTIFY_SWEEP_INTERVAL_MS)
+                val cutoff = System.currentTimeMillis() - ICMP_NOTIFY_COOLDOWN_MS
+                ipv6UdpIcmpNotified.entries.removeIf { it.value < cutoff }
+            }
+        }
 
         packetLoopJob = tunnelScope.launch {
             val buffer = ByteArray(MTU_BUFFER_SIZE)
@@ -163,6 +182,9 @@ class PacketTunnel(
     fun stop() {
         packetLoopJob?.cancel()
         packetLoopJob = null
+        icmpNotifySweeperJob?.cancel()
+        icmpNotifySweeperJob = null
+        ipv6UdpIcmpNotified.clear()
         udpNat.closeAll()
         tcpNat.closeAll()
         outputStream = null
@@ -229,20 +251,50 @@ class PacketTunnel(
                         // jalurnya buntu — persis gejala "video/reels buffering lama,
                         // upload/download lambat" yang dilaporkan pada app yang CDN-nya
                         // memprioritaskan IPv6 (mis. Meta: Facebook/Instagram/WhatsApp).
-                        // Fix: balas ICMPv6 Port Unreachable SEGERA supaya client
-                        // langsung tahu jalur IPv6 ini buntu dan (lewat Happy Eyeballs/
-                        // QUIC connection migration bawaan OS/app) berpindah ke jalur
-                        // IPv4 yang SUDAH benar-benar di-NAT & difilter
-                        // (UdpNatManager). IPv6 non-DNS SENGAJA tetap tidak di-relay
-                        // (bukan cuma dibuat tidak-blackhole) — implementasi relay IPv6
-                        // penuh tetap keterbatasan terdokumentasi, lihat catatan class
-                        // ini & RENCANA_PRODUKSI_NETSHIELD.md §Catatan Penting.
-                        val icmp = NetPacketUtils.buildIpv6IcmpPortUnreachable(
-                            srcIp = ipv6.dstIp,
-                            dstIp = ipv6.srcIp,
-                            originalPacket = packet
-                        )
-                        writeToTun(icmp)
+                        // Fix: balas ICMPv6 Port Unreachable supaya client langsung
+                        // tahu jalur IPv6 ini buntu dan (lewat Happy Eyeballs/QUIC
+                        // connection migration bawaan OS/app) berpindah ke jalur IPv4
+                        // yang SUDAH benar-benar di-NAT & difilter (UdpNatManager).
+                        //
+                        // Fase Audit-6 (BUG KRITIS REGRESI ditemukan — laporan: SETELAH
+                        // Audit-5 dipasang, internet malah JAUH LEBIH PARAH: Play Store
+                        // search timeout, Claude app sendiri gagal kirim chat/lampiran,
+                        // tes jaringan Mobile Legends gagal total): kode Audit-5 di atas
+                        // mengirim SATU paket ICMPv6 balasan untuk **SETIAP** paket UDP
+                        // IPv6 non-DNS yang lewat — bukan cuma sekali per "sesi". UDP
+                        // tidak punya flag SYN seperti TCP untuk menandai "paket
+                        // pertama", jadi versi Audit-5 salah asumsi tiap paket harus
+                        // dibalas. Di jaringan dual-stack (banyak app/SDK Google —
+                        // termasuk Play Store & kemungkinan besar backend Claude app
+                        // sendiri — memakai QUIC/UDP lewat IPv6 secara default, bisa
+                        // ratusan-ribuan paket/detik saat banyak app aktif), ini
+                        // menciptakan "badai" balasan ICMP yang ditulis lewat
+                        // `writeToTun()` (lock GLOBAL yang sama dipakai SEMUA trafik
+                        // TCP+UDP+DNS, termasuk trafik IPv4 yang sudah sehat) — jauh
+                        // lebih membebani tunnel daripada kondisi SEBELUM Audit-5 sama
+                        // sekali (yang minimal "cuma" diam, tidak menambah beban tulis).
+                        // Inilah kenapa SEMUA hal sempat gagal total, bukan cuma lambat.
+                        //
+                        // Fix: dedupe per key (srcPort, dstIp, dstPort) — HANYA kirim
+                        // ICMPv6 Port Unreachable SEKALI per kombinasi ini per
+                        // [ICMP_NOTIFY_COOLDOWN_MS], meniru semantik "hanya balas SYN"
+                        // di jalur TCP. Client tetap dapat sinyal cepat pada percobaan
+                        // PERTAMA (tujuan awal Audit-5 tercapai), tapi paket ke-2 dst.
+                        // dalam sesi/QUIC-retry yang sama tidak lagi memicu balasan
+                        // baru — menghilangkan badai tulis ke tun.
+                        val notifyKey = Ipv6UdpNotifyKey(udp.srcPort, NetPacketUtils.ipToString(ipv6.dstIp), udp.dstPort)
+                        val now = System.currentTimeMillis()
+                        val lastNotified = ipv6UdpIcmpNotified.putIfAbsent(notifyKey, now)
+                        val shouldNotify = lastNotified == null || (now - lastNotified) > ICMP_NOTIFY_COOLDOWN_MS
+                        if (shouldNotify) {
+                            ipv6UdpIcmpNotified[notifyKey] = now
+                            val icmp = NetPacketUtils.buildIpv6IcmpPortUnreachable(
+                                srcIp = ipv6.dstIp,
+                                dstIp = ipv6.srcIp,
+                                originalPacket = packet
+                            )
+                            writeToTun(icmp)
+                        }
                     }
                 }
                 NetPacketUtils.PROTOCOL_TCP -> {
@@ -503,6 +555,18 @@ class PacketTunnel(
         const val DNS_PORT = 53
         const val MTU_BUFFER_SIZE = 1500
         const val UPSTREAM_TIMEOUT_MS = 2500
+        // Fase Audit-6: jeda minimum antar balasan ICMPv6 Port Unreachable
+        // untuk kombinasi (srcPort, dstIp, dstPort) UDP-over-IPv6 yang sama —
+        // lihat dokumentasi bug kritis regresi di handlePacket. 10 detik cukup
+        // untuk membuat client gagal-cepat di percobaan pertama tanpa
+        // menciptakan badai balasan saat QUIC retry berkali-kali dalam sesi
+        // yang sama.
+        private const val ICMP_NOTIFY_COOLDOWN_MS = 10_000L
+        // Fase Audit-6: interval pembersihan entri kadaluarsa di
+        // ipv6UdpIcmpNotified — tanpa ini map akan tumbuh tanpa batas
+        // selama VPN aktif (setiap kombinasi port sumber baru menambah
+        // entri baru, port sumber acak/ephemeral tiap koneksi baru).
+        private const val ICMP_NOTIFY_SWEEP_INTERVAL_MS = 60_000L
     }
 }
 
