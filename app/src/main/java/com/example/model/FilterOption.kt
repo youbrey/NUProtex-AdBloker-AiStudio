@@ -103,6 +103,38 @@ data class FilterOption(
                 iconRes = "public",
                 ruleCount = 0,
                 badgeColorHex = "#00B0FF"
+            ),
+            // Audit-8: kategori baru dari perluasan sumber HaGeZi.
+            FilterOption(
+                id = "anti_piracy",
+                title = "Blokir Situs Pembajakan & Distribusi Ilegal",
+                description = "Blokir domain streaming/download bajakan (HaGeZi Anti-Piracy) — situs jenis ini sering jadi vektor malware",
+                isEnabled = true,
+                iconRes = "block",
+                ruleCount = 0,
+                badgeColorHex = "#D50000"
+            ),
+            FilterOption(
+                id = "url_shortener_guard",
+                title = "Blokir URL Shortener Berisiko",
+                description = "Blokir domain pemendek URL yang sering dipakai menyamarkan tautan phishing/scam",
+                isEnabled = true,
+                iconRes = "link_off",
+                ruleCount = 0,
+                badgeColorHex = "#FF6D00"
+            ),
+            // Default MATI (bukan aktif) — lihat dokumentasi BlocklistSource
+            // ("Audit-8"): berpotensi mengganggu app privasi/VPN lain di
+            // perangkat yang sengaja pakai DoH ke resolver publik. User yang
+            // paham risikonya bisa aktifkan manual di Pengaturan.
+            FilterOption(
+                id = "doh_bypass_guard",
+                title = "Cegah Bypass DNS via DoH/VPN/Proxy Lain",
+                description = "Blokir resolver DoH & proxy pihak ketiga yang bisa dipakai app lain melewati proteksi NetShield. PERINGATAN: bisa mengganggu app privasi/VPN lain di perangkat — nonaktif secara default.",
+                isEnabled = false,
+                iconRes = "vpn_lock",
+                ruleCount = 0,
+                badgeColorHex = "#616161"
             )
         )
     }
