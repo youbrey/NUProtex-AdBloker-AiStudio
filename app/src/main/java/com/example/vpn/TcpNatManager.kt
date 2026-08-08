@@ -111,8 +111,9 @@ class TcpNatManager(
     ) {
         @Volatile var state: State = State.SYN_RECEIVED
         // seq/ack dalam ruang 32-bit unsigned, disimpan sebagai Long agar mudah dihitung.
-        // HANYA ditulis dari dalam writerJob (arah client->server) atau readLoop (arah
-        // server->client) masing-masing satu coroutine per sesi -> aman tanpa lock tambahan.
+        // HANYA ditulis dari dalam writerJob (arah client->server) atau tunWriterJob (arah
+        // server->client, lihat Audit-4) masing-masing satu coroutine per sesi -> aman
+        // tanpa lock tambahan.
         @Volatile var serverSeq: Long = INITIAL_SERVER_SEQ
         @Volatile var clientNextSeq: Long = 0L // byte berikutnya yang kita harapkan dari klien
         // Fase Audit-2: true jika klien menyertakan opsi Window Scale di SYN-nya
@@ -120,12 +121,33 @@ class TcpNatManager(
         @Volatile var windowScaleEnabled: Boolean = false
         var readerJob: Job? = null
         var writerJob: Job? = null
+        // Fase Audit-4: consumer terpisah yang benar-benar memanggil writeToTun()
+        // untuk arah server->client — lihat dokumentasi kelas & [tunWriterLoop].
+        var tunWriterJob: Job? = null
         // FIFO — menjamin byte ditulis ke socket upstream PERSIS urutan kedatangan dari klien.
         val outboundChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
+        // Fase Audit-4: FIFO arah server->client (readLoop -> tunWriterLoop). Dibatasi
+        // (bukan UNLIMITED) supaya jadi bantalan backpressure yang wajar, TAPI readLoop
+        // memakai `send()` yang suspend (BUKAN trySend yang bisa drop) — untuk TCP,
+        // men-drop satu segmen berarti byte hilang permanen & MERUSAK stream (beda
+        // dari UDP yang inheren toleran kehilangan paket). Lihat [readLoop]/[tunWriterLoop].
+        val inboundChannel = Channel<InboundEvent>(capacity = TCP_INBOUND_CHANNEL_CAPACITY)
         @Volatile var lastActive: Long = System.currentTimeMillis()
         @Volatile var clientFinReceived: Boolean = false
         @Volatile var serverFinSent: Boolean = false
     }
+
+    /**
+     * Event arah server->client yang diantre lewat [Session.inboundChannel] —
+     * Fase Audit-4. Dijaga satu tipe (bukan langsung ByteArray) supaya
+     * urutan data vs FIN dari server TETAP terjamin persis sama seperti
+     * kedatangan asli dari socket (readLoop adalah satu-satunya producer).
+     */
+    private sealed class InboundEvent {
+        data class Data(val payload: ByteArray) : InboundEvent()
+        object ServerFin : InboundEvent()
+    }
+
 
     private val sessions = ConcurrentHashMap<SessionKey, Session>()
     private val identification = AtomicInteger(1)
@@ -252,6 +274,9 @@ class TcpNatManager(
 
                 session.readerJob = scope.launch(Dispatchers.IO) { readLoop(key, session) }
                 session.writerJob = scope.launch(Dispatchers.IO) { writerLoop(key, session) }
+                // Fase Audit-4: consumer khusus yang benar-benar menulis ke tun untuk arah
+                // server->client — lihat dokumentasi kelas & [tunWriterLoop].
+                session.tunWriterJob = scope.launch(Dispatchers.IO) { tunWriterLoop(key, session) }
             } catch (e: Exception) {
                 Log.w(TAG, "TCP connect gagal ke ${NetPacketUtils.ipToString(ip.dstIp)}:${tcp.dstPort}: ${e.message}")
                 // Beri tahu klien koneksi ditolak, supaya app tidak menggantung menunggu timeout lama.
@@ -310,6 +335,54 @@ class TcpNatManager(
         session.outboundChannel.close()
     }
 
+    /**
+     * Fase Audit-4 (BUG KRITIS ditemukan lewat audit lanjutan — laporan:
+     * "browsing/reels/game/download/upload tetap lambat" WALAU Audit-2
+     * (MSS/Window Scale) & Audit-3 (fix UDP) sudah diterapkan):
+     *
+     * Root cause: `readLoop()` (arah server->client, yaitu SEMUA download —
+     * gambar/video/API/halaman web) sebelumnya memanggil `sendDataSegment()`
+     * -> `writeToTun()` (lock GLOBAL, dipakai bersama SEMUA sesi TCP+UDP+DNS
+     * sekaligus) LANGSUNG dari dalam loop yang sama dengan `input.read()`.
+     * Ini PERSIS kelas bug yang sama yang sudah diperbaiki untuk UDP di
+     * Audit-3 — TAPI waktu itu perbaikannya tidak ikut diterapkan ke TCP.
+     * Karena mayoritas trafik nyata (halaman web, gambar/video non-QUIC,
+     * API call, download, banyak game) berjalan di atas TCP, dampaknya jauh
+     * lebih luas & konsisten dengan SEMUA gejala yang dilaporkan sekaligus:
+     *  - Saat banyak sesi TCP aktif bersamaan (khas: satu halaman web/app
+     *    medsos modern bisa membuka puluhan koneksi paralel; video +
+     *    scrolling feed + gambar + API polling semua nyala bersamaan),
+     *    tiap `readLoop()` sesi harus antre lock yang sama berkali-kali per
+     *    siklus baca (READ_BUFFER_SIZE 16KB dipecah jadi ~12 segmen MSS ->
+     *    12x akuisisi lock per satu `input.read()`).
+     *  - Selama satu `readLoop()` menunggu lock, ia TIDAK memanggil
+     *    `input.read()` lagi -> buffer kernel socket TCP relay penuh ->
+     *    TCP asli (jaringan sungguhan) menerapkan flow control (window
+     *    menuju nol) ke server sungguhan -> server pun memperlambat kirim.
+     *    Efek ini BERANTAI ke SEMUA sesi lain yang kebetulan ikut menunggu
+     *    lock yang sama, menjelaskan kenapa SEMUA jenis trafik (bukan cuma
+     *    satu app) terasa lambat bersamaan hanya saat proteksi aktif.
+     *
+     * Fix: pola identik dengan UDP Audit-3 — `readLoop()` sekarang HANYA
+     * `input.read()` + `inboundChannel.send()` (mengantre, tidak pernah
+     * memanggil `writeToTun()` sendiri). [tunWriterLoop] adalah SATU-satunya
+     * consumer yang benar-benar menulis ke tun untuk sesi ini.
+     *
+     * PENTING (beda dari UDP): dipakai `send()` yang suspend, BUKAN
+     * `trySend()`. UDP boleh men-drop paket saat channel penuh (UDP inheren
+     * toleran kehilangan paket, retransmit ditangani level aplikasi/QUIC).
+     * TCP TIDAK BOLEH — men-drop satu segmen di sini akan membuat byte
+     * hilang permanen dari stream (bukan retransmit oleh relay kita sendiri
+     * yang berpura-pura jadi TCP asli), berisiko merusak record TLS/HTTP
+     * dan membuat koneksi di-reset klien. `send()` yang suspend berarti
+     * saat `inboundChannel` penuh (consumer belum sempat menguras), producer
+     * (readLoop) berhenti sejenak menunggu ruang — inilah backpressure TCP
+     * yang BENAR: kalau memang tun/lock jadi bottleneck sungguhan (bukan
+     * cuma kontensi sesaat antar sesi), barulah `input.read()` ikut
+     * tertunda, dan itu tepat sinyal yang seharusnya diteruskan sebagai
+     * flow control ke server asli — bukan korupsi data diam-diam.
+     * Lihat CHANGELOG-v2.md §Audit-4 untuk detail & status verifikasi.
+     */
     private suspend fun readLoop(key: SessionKey, session: Session) = withContext(Dispatchers.IO) {
         val buffer = ByteArray(READ_BUFFER_SIZE)
         try {
@@ -321,11 +394,10 @@ class TcpNatManager(
                     -1
                 }
                 if (n < 0) {
-                    // Server menutup koneksi -> kirim FIN ke klien.
-                    sendControlSegment(session, key, flags = NetPacketUtils.TCP_FLAG_FIN or NetPacketUtils.TCP_FLAG_ACK)
-                    session.serverSeq = (session.serverSeq + 1) and 0xFFFFFFFFL
-                    session.serverFinSent = true
-                    session.state = if (session.clientFinReceived) State.TIME_WAIT else State.FIN_WAIT_1
+                    // Server menutup koneksi -> antre event FIN, biar tunWriterLoop yang
+                    // benar-benar kirim (jaga urutan: FIN tidak boleh mendahului data yang
+                    // masih tertunda di inboundChannel).
+                    session.inboundChannel.send(InboundEvent.ServerFin)
                     break
                 }
                 if (n == 0) continue
@@ -336,13 +408,46 @@ class TcpNatManager(
                 while (offset < chunk.size) {
                     val end = (offset + MAX_SEGMENT_SIZE).coerceAtMost(chunk.size)
                     val segment = chunk.copyOfRange(offset, end)
-                    sendDataSegment(session, key, segment)
+                    // send() suspend (BUKAN trySend) — lihat dokumentasi di atas kenapa TCP
+                    // tidak boleh drop diam-diam seperti UDP.
+                    session.inboundChannel.send(InboundEvent.Data(segment))
                     offset = end
                 }
                 session.lastActive = System.currentTimeMillis()
             }
         } catch (e: Exception) {
             Log.d(TAG, "TCP relay read loop berhenti untuk $key: ${e.message}")
+        } finally {
+            // tunWriterLoop yang memegang tanggung jawab closeSession() setelah channel
+            // benar-benar habis dikuras (lihat [tunWriterLoop]) — di sini cukup tutup
+            // channel-nya supaya consumer tahu tidak akan ada event baru lagi.
+            session.inboundChannel.close()
+        }
+    }
+
+    /**
+     * Fase Audit-4: SATU-satunya coroutine yang memanggil `writeToTun()` untuk
+     * arah server->client sesi ini — menguras [Session.inboundChannel] secara
+     * FIFO (jadi urutan data & FIN persis sama dengan urutan asli dari socket
+     * server, walau sekarang `writeToTun()`-nya sendiri terjadi di coroutine
+     * terpisah dari `input.read()`). Padanan persis `tunWriterLoop` yang sudah
+     * ada di [UdpNatManager] sejak Audit-3, sekarang diterapkan juga di sini.
+     */
+    private suspend fun tunWriterLoop(key: SessionKey, session: Session) = withContext(Dispatchers.IO) {
+        try {
+            for (event in session.inboundChannel) {
+                when (event) {
+                    is InboundEvent.Data -> sendDataSegment(session, key, event.payload)
+                    InboundEvent.ServerFin -> {
+                        sendControlSegment(session, key, flags = NetPacketUtils.TCP_FLAG_FIN or NetPacketUtils.TCP_FLAG_ACK)
+                        session.serverSeq = (session.serverSeq + 1) and 0xFFFFFFFFL
+                        session.serverFinSent = true
+                        session.state = if (session.clientFinReceived) State.TIME_WAIT else State.FIN_WAIT_1
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "TCP tunWriterLoop berhenti untuk $key: ${e.message}")
         } finally {
             if (session.state == State.TIME_WAIT) {
                 // Beri sedikit waktu untuk ACK terakhir klien datang, lalu bersihkan.
@@ -420,8 +525,10 @@ class TcpNatManager(
             }
         }
         session.outboundChannel.close()
+        session.inboundChannel.close()
         session.readerJob?.cancel()
         session.writerJob?.cancel()
+        session.tunWriterJob?.cancel()
         try { session.socket.close() } catch (_: Exception) {}
         session.state = State.CLOSED
     }
@@ -452,6 +559,12 @@ class TcpNatManager(
         // ~4 MB — jauh di atas batas 64KB lama, memungkinkan throughput tinggi
         // di link berlatensi lebih tinggi (video/reels/game di jaringan seluler).
         private const val ADVERTISED_WINDOW_BYTES = 65535 shl SERVER_WINDOW_SCALE_SHIFT
+        // Fase Audit-4: kapasitas buffer arah server->client (readLoop -> tunWriterLoop).
+        // Diberi sedikit ruang (bukan 0/rendezvous) supaya bursty read dari socket tidak
+        // langsung membuat readLoop menunggu; TAPI tetap dibatasi (bukan UNLIMITED) supaya
+        // backpressure `send()` yang suspend benar-benar bisa "terasa" sampai ke socket
+        // asli saat tun/lock jadi bottleneck sungguhan, bukan menumpuk tanpa batas di RAM.
+        private const val TCP_INBOUND_CHANNEL_CAPACITY = 64
         // Fase Audit-3: buffer kernel socket TCP diperbesar (default OS
         // seringkali cukup kecil), membantu throughput di link berlatensi
         // lebih tinggi bersamaan dengan Window Scale (Audit-2).
