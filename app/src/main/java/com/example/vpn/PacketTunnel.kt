@@ -68,6 +68,37 @@ import java.util.concurrent.atomic.AtomicInteger
  *    [ProtectingSocketFactory] khusus (padanan `VpnService.protect()` untuk
  *    koneksi TCP/TLS, bukan cuma DatagramSocket seperti Fase 1.5).
  *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Fase 5.
+ * [Audit-5 - 2026-08-09] **BUG KRITIS ditemukan** (laporan: "internet SANGAT
+ * lambat saat proteksi aktif — video FB/IG/TikTok/WA tidak mau main, game
+ * & download/upload turun drastis, TAPI speedtest normal"):
+ *  - Root cause: sejak Fase 6.10 (`addRoute("::", 0)` catch-all IPv6
+ *    ditambahkan di `NetShieldVpnService`), SELURUH trafik IPv6 non-DNS
+ *    (TCP & UDP) masuk ke tunnel ini tapi diam-diam DIABAIKAN — tidak ada
+ *    balasan RST/ICMP apa pun dikirim. Client (browser/app) yang mencoba
+ *    connect lewat IPv6 (CDN Meta — Facebook/Instagram/WhatsApp — sangat
+ *    dikenal memprioritaskan IPv6) menunggu FULL connect timeout OS
+ *    (puluhan detik) sebelum akhirnya fallback ke IPv4 lewat mekanisme
+ *    Happy Eyeballs, alih-alih gagal-cepat. Speedtest.net TIDAK terdampak
+ *    karena test node-nya di-resolve/dipilih via IPv4 eksplisit — inilah
+ *    kenapa speedtest terlihat normal padahal app lain terasa sangat
+ *    lambat, PERSIS gejala yang dilaporkan.
+ *  - Fix: `handlePacket` sekarang membalas SEGERA untuk trafik IPv6
+ *    non-DNS — TCP RST+ACK untuk setiap SYN (`NetPacketUtils.buildIpv6TcpRst`),
+ *    ICMPv6 Port Unreachable untuk UDP (`buildIpv6IcmpPortUnreachable`).
+ *    Client jadi tahu SEGERA bahwa jalur IPv6 buntu dan berpindah ke jalur
+ *    IPv4 yang SUDAH benar-benar di-NAT & difilter oleh `TcpNatManager`/
+ *    `UdpNatManager` (termasuk seluruh perbaikan performa Audit-1..4).
+ *  - KETERBATASAN TETAP ADA (disengaja, transparan): ini BUKAN implementasi
+ *    relay IPv6 penuh — trafik IPv6 non-DNS tetap tidak diteruskan/difilter
+ *    langsung oleh NetShield, hanya digagalkan cepat supaya OS/app pindah
+ *    ke IPv4. Konsekuensi: iklan/tracker yang HANYA bisa diakses lewat
+ *    IPv6 murni (tanpa fallback IPv4 sama sekali) tidak akan terblokir DNS
+ *    di level ini — kasus sangat jarang karena hampir seluruh domain publik
+ *    modern dual-stack. Implementasi relay IPv6 penuh (setara
+ *    TcpNatManager/UdpNatManager IPv4) tetap dicatat sebagai potensi kerja
+ *    lanjutan, bukan prioritas karena dampak nyata dari fix gagal-cepat
+ *    ini sudah menyelesaikan gejala performa yang dilaporkan.
+ *  Lihat CHANGELOG.md §Audit-5 untuk detail & status verifikasi.
  */
 class PacketTunnel(
     private val vpnService: VpnService,
@@ -189,10 +220,62 @@ class PacketTunnel(
                     val udp = NetPacketUtils.parseUdpHeader(packet, ipv6.headerLength, length) ?: return
                     if (udp.dstPort == DNS_PORT) {
                         handleDnsQueryIpv6(packet, ipv6, udp)
+                    } else {
+                        // Fase Audit-5 (BUG KRITIS): sebelumnya trafik UDP-over-IPv6
+                        // non-DNS diam-diam DIABAIKAN (tidak ada balasan sama sekali)
+                        // walau `Builder.addRoute("::", 0)` (Fase 6.10) sudah menangkap
+                        // SEMUA trafik IPv6 masuk ke tunnel ini. Client menunggu
+                        // timeout QUIC/UDP yang bisa berlangsung lama tanpa tahu
+                        // jalurnya buntu — persis gejala "video/reels buffering lama,
+                        // upload/download lambat" yang dilaporkan pada app yang CDN-nya
+                        // memprioritaskan IPv6 (mis. Meta: Facebook/Instagram/WhatsApp).
+                        // Fix: balas ICMPv6 Port Unreachable SEGERA supaya client
+                        // langsung tahu jalur IPv6 ini buntu dan (lewat Happy Eyeballs/
+                        // QUIC connection migration bawaan OS/app) berpindah ke jalur
+                        // IPv4 yang SUDAH benar-benar di-NAT & difilter
+                        // (UdpNatManager). IPv6 non-DNS SENGAJA tetap tidak di-relay
+                        // (bukan cuma dibuat tidak-blackhole) — implementasi relay IPv6
+                        // penuh tetap keterbatasan terdokumentasi, lihat catatan class
+                        // ini & RENCANA_PRODUKSI_NETSHIELD.md §Catatan Penting.
+                        val icmp = NetPacketUtils.buildIpv6IcmpPortUnreachable(
+                            srcIp = ipv6.dstIp,
+                            dstIp = ipv6.srcIp,
+                            originalPacket = packet
+                        )
+                        writeToTun(icmp)
                     }
                 }
+                NetPacketUtils.PROTOCOL_TCP -> {
+                    // Fase Audit-5 (BUG KRITIS, bagian paling berdampak): TCP-over-IPv6
+                    // (jalur utama video/gambar/API non-QUIC) sebelumnya juga diam-diam
+                    // diabaikan. SYN yang masuk tidak pernah dibalas apa pun -> klien
+                    // menunggu penuh connect timeout OS (bisa 20-75 detik tergantung
+                    // platform) sebelum akhirnya mencoba IPv4 — inilah penyebab utama
+                    // laporan "internet sangat lambat saat proteksi aktif" padahal
+                    // speedtest (yang memaksa IPv4 eksplisit ke server ujinya) terlihat
+                    // normal. Fix: balas TCP RST+ACK segera untuk SYN di jalur ini,
+                    // supaya OS/browser langsung gagal-cepat dan pindah ke IPv4.
+                    val tcp = NetPacketUtils.parseTcpHeader(packet, ipv6.headerLength, length) ?: return
+                    if (tcp.flags and NetPacketUtils.TCP_FLAG_SYN != 0) {
+                        val rst = NetPacketUtils.buildIpv6TcpRst(
+                            srcIp = ipv6.dstIp,
+                            srcPort = tcp.dstPort,
+                            dstIp = ipv6.srcIp,
+                            dstPort = tcp.srcPort,
+                            seq = 0L,
+                            ack = (tcp.seq + 1) and 0xFFFFFFFFL
+                        )
+                        writeToTun(rst)
+                    }
+                    // Segmen non-SYN (data/FIN/ACK) untuk sesi IPv6 yang memang
+                    // tidak pernah ter-establish di sisi kita diabaikan saja — RST
+                    // di atas sudah dikirim saat SYN pertama, klien seharusnya
+                    // sudah berhenti mencoba jalur ini.
+                }
                 else -> {
-                    // Trafik IPv6 non-DNS
+                    // ICMPv6 & protokol IPv6 lain di luar cakupan (Neighbor
+                    // Discovery dkk. ditangani sistem Android sendiri di luar
+                    // tun, bukan lewat jalur ini).
                 }
             }
         }

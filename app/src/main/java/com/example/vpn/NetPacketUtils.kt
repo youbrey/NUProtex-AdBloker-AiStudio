@@ -292,6 +292,112 @@ object NetPacketUtils {
 
     fun ipToString(ip: ByteArray): String = InetAddress.getByAddress(ip).hostAddress ?: "?"
 
+    /**
+     * Fase Audit-5: bangun paket TCP RST+ACK sintetis di atas IPv6.
+     *
+     * Dipakai `PacketTunnel` untuk membalas SYN TCP-over-IPv6 non-DNS
+     * SECEPATNYA (bukan cuma "diabaikan" seperti sebelumnya) — lihat
+     * dokumentasi bug kritis di header `PacketTunnel.handlePacket`/
+     * `NetShieldVpnService`. RST langsung membuat TCP stack klien tahu
+     * koneksi ditolak dan (lewat mekanisme Happy Eyeballs/dual-stack milik
+     * OS/browser sendiri) segera mencoba jalur IPv4 yang SUDAH benar-benar
+     * di-NAT & difilter oleh `TcpNatManager` — alih-alih menunggu timeout
+     * IPv6 selama puluhan detik yang terasa sebagai "internet sangat
+     * lambat" oleh user.
+     */
+    fun buildIpv6TcpRst(
+        srcIp: ByteArray,
+        srcPort: Int,
+        dstIp: ByteArray,
+        dstPort: Int,
+        seq: Long,
+        ack: Long
+    ): ByteArray {
+        val tcpLength = 20
+        val totalLength = 40 + tcpLength
+        val out = ByteArray(totalLength)
+
+        out[0] = 0x60
+        out[4] = ((tcpLength shr 8) and 0xFF).toByte()
+        out[5] = (tcpLength and 0xFF).toByte()
+        out[6] = PROTOCOL_TCP.toByte()
+        out[7] = 64
+        System.arraycopy(srcIp, 0, out, 8, 16)
+        System.arraycopy(dstIp, 0, out, 24, 16)
+
+        val tcpSegment = ByteArray(tcpLength)
+        tcpSegment[0] = ((srcPort shr 8) and 0xFF).toByte()
+        tcpSegment[1] = (srcPort and 0xFF).toByte()
+        tcpSegment[2] = ((dstPort shr 8) and 0xFF).toByte()
+        tcpSegment[3] = (dstPort and 0xFF).toByte()
+        writeUInt32(tcpSegment, 4, seq)
+        writeUInt32(tcpSegment, 8, ack)
+        tcpSegment[12] = (5 shl 4).toByte() // dataOffset=5 words (20 byte), tanpa opsi
+        tcpSegment[13] = (TCP_FLAG_RST or TCP_FLAG_ACK).toByte()
+        tcpSegment[14] = 0
+        tcpSegment[15] = 0
+
+        val checksum = transportChecksumIpv6(srcIp, dstIp, PROTOCOL_TCP, tcpSegment)
+        tcpSegment[16] = ((checksum shr 8) and 0xFF).toByte()
+        tcpSegment[17] = (checksum and 0xFF).toByte()
+
+        System.arraycopy(tcpSegment, 0, out, 40, tcpLength)
+        return out
+    }
+
+    /**
+     * Fase Audit-5: bangun paket ICMPv6 "Destination Unreachable — Port
+     * Unreachable" (type 1, code 4 — RFC 4443 §3.1), dibungkus header IPv6.
+     *
+     * Dipakai untuk membalas paket UDP-over-IPv6 non-DNS (mis. QUIC/HTTP3
+     * lewat port 443 IPv6, umum dipakai CDN Meta/Google) — memberi tahu
+     * klien SEGERA bahwa jalur ini tertutup, supaya lapisan atas (QUIC
+     * connection migration / Happy Eyeballs) langsung mencoba jalur IPv4
+     * yang sudah dinat lewat `UdpNatManager`, alih-alih menunggu retry/
+     * timeout QUIC yang bisa berlangsung lama & terasa sebagai buffering
+     * video tanpa sebab jelas.
+     *
+     * [originalPacket] wajib payload ICMPv6 sesuai RFC: sebanyak mungkin
+     * byte dari paket asli yang memicu error (di sini kita sertakan utuh,
+     * dipotong ke maksimal supaya total paket balasan tidak melebihi MTU).
+     */
+    fun buildIpv6IcmpPortUnreachable(
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        originalPacket: ByteArray
+    ): ByteArray {
+        // RFC 4443: sertakan sebanyak mungkin paket asli tanpa membuat balasan melebihi MTU minimum IPv6 (1280).
+        val maxOriginalBytes = (1280 - 40 - 8).coerceAtMost(originalPacket.size)
+        val truncatedOriginal = originalPacket.copyOf(maxOriginalBytes)
+
+        val icmpLength = 8 + truncatedOriginal.size
+        val totalLength = 40 + icmpLength
+        val out = ByteArray(totalLength)
+
+        out[0] = 0x60
+        out[4] = ((icmpLength shr 8) and 0xFF).toByte()
+        out[5] = (icmpLength and 0xFF).toByte()
+        out[6] = NEXT_HEADER_ICMPV6.toByte()
+        out[7] = 64
+        System.arraycopy(srcIp, 0, out, 8, 16)
+        System.arraycopy(dstIp, 0, out, 24, 16)
+
+        val icmpSegment = ByteArray(icmpLength)
+        icmpSegment[0] = 1 // Type: Destination Unreachable
+        icmpSegment[1] = 4 // Code: Port Unreachable
+        icmpSegment[2] = 0 // Checksum (diisi di bawah)
+        icmpSegment[3] = 0
+        // Byte 4-7: Unused (harus 0)
+        System.arraycopy(truncatedOriginal, 0, icmpSegment, 8, truncatedOriginal.size)
+
+        val checksum = transportChecksumIpv6(srcIp, dstIp, NEXT_HEADER_ICMPV6, icmpSegment)
+        icmpSegment[2] = ((checksum shr 8) and 0xFF).toByte()
+        icmpSegment[3] = (checksum and 0xFF).toByte()
+
+        System.arraycopy(icmpSegment, 0, out, 40, icmpLength)
+        return out
+    }
+
     // ---- UDP --------------------------------------------------------------
 
     data class UdpHeader(val srcPort: Int, val dstPort: Int, val length: Int, val payloadOffset: Int)
