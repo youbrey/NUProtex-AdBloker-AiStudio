@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.FileDescriptor
 import java.net.InetAddress
+import java.util.concurrent.Semaphore
 
 /**
  * Relay ICMP Echo Request/Reply (ping) — Fase Audit-14.
@@ -55,6 +56,23 @@ import java.net.InetAddress
  *  - BELUM diuji di device fisik (tidak ada akses raw socket di sandbox
  *    kerja ini) — perilaku `android.system.Os` untuk ping socket WAJIB
  *    diverifikasi Fandri di HP nyata sebelum dianggap final.
+ *
+ * [Audit-14 — KOREKSI DIRI, sama hari] BUG REGRESI ditemukan oleh user:
+ * versi awal kelas ini memanggil `scope.launch(Dispatchers.IO) {}` BARU
+ * untuk SETIAP paket Echo Request tanpa batas atas sama sekali — PERSIS
+ * pola "launch tak terbatas per-paket" yang jadi akar bug pertama kali
+ * (race condition penulisan TCP) dan yang coba dibatasi lewat
+ * `MAX_SESSIONS` di `TcpNatManager`/`UdpNatManager` (Audit-13). Tool
+ * diagnostik jaringan game lazimnya mengirim ping BERUNTUN (burst
+ * 10-50+ dalam beberapa detik untuk mengukur jitter/packet loss), yang
+ * berarti versi awal ini bisa memicu ledakan coroutine+raw-socket
+ * bersamaan justru saat tool itu dijalankan — mengulang kelas masalah
+ * yang sama yang baru saja diperbaiki Audit-13, hanya berpindah lokasi.
+ * Fix: [inFlightLimiter] membatasi jumlah relay ICMP yang boleh berjalan
+ * BERSAMAAN; permintaan yang melebihi batas di-drop (bukan diantre tanpa
+ * batas) — ping yang di-drop sesekali tidak masalah bagi tool ping (akan
+ * dianggap "timeout" satu kali, bukan gagal total), jauh lebih aman
+ * daripada membiarkan socket/coroutine menumpuk tak terbatas.
  */
 class IcmpRelay(
     private val vpnService: VpnService,
@@ -68,7 +86,13 @@ class IcmpRelay(
         private const val ICMP_TYPE_ECHO_REPLY = 0
         private const val REPLY_TIMEOUT_MS = 3000
         private const val RECV_BUFFER_SIZE = 1500
+        // Audit-14 koreksi: batas relay ICMP konkuren. 32 jauh lebih dari
+        // cukup untuk burst ping tool diagnostik game (biasanya <10 sekaligus),
+        // sambil mencegah ledakan socket/thread tak terbatas seperti versi awal.
+        private const val MAX_CONCURRENT_ICMP_RELAYS = 32
     }
+
+    private val inFlightLimiter = Semaphore(MAX_CONCURRENT_ICMP_RELAYS)
 
     /** Dipanggil sinkron dari packet loop (PacketTunnel) untuk paket ICMP keluar. */
     fun onOutboundPacket(packet: ByteArray, ip: NetPacketUtils.Ipv4Header) {
@@ -81,9 +105,22 @@ class IcmpRelay(
             return
         }
 
+        // Audit-14 koreksi: batasi konkurensi — kalau sudah penuh, DROP paket
+        // ini (bukan launch coroutine baru tanpa batas). Log di level debug
+        // saja karena ini kondisi yang diharapkan bisa terjadi sesekali saat
+        // burst ping, bukan error.
+        if (!inFlightLimiter.tryAcquire()) {
+            Log.d(TAG, "Relay ICMP penuh ($MAX_CONCURRENT_ICMP_RELAYS konkuren), drop 1 echo request")
+            return
+        }
+
         val icmpPayload = packet.copyOfRange(icmpOffset, packet.size)
         scope.launch(Dispatchers.IO) {
-            relayEchoRequest(ip, icmpPayload)
+            try {
+                relayEchoRequest(ip, icmpPayload)
+            } finally {
+                inFlightLimiter.release()
+            }
         }
     }
 
