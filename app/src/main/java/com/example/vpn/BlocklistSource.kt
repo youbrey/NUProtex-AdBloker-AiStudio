@@ -115,8 +115,6 @@ object BlocklistSource {
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/anti.piracy.txt"
     private const val HAGEZI_ULTIMATE =
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/ultimate.txt"
-    private const val HAGEZI_MULTI =
-        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/multi.txt"
     private const val HAGEZI_GAMBLING_MEDIUM =
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/gambling.medium.txt"
     private const val HAGEZI_NATIVE_XIAOMI =
@@ -171,7 +169,17 @@ object BlocklistSource {
         // otomatis dilindungi ESSENTIAL_ALLOWLIST di BlocklistEngine
         // (keduanya terverifikasi berisi graph.facebook.com/graph.instagram.com/
         // graph.whatsapp.com/gateway.instagram.com — lihat CHANGELOG-v2.md §Audit-8).
-        Source("trackers", HAGEZI_MULTI, "hagezi_multi"),
+        // Audit-10: "multi.txt" DIHAPUS dari sini. Verifikasi 1:1 domain
+        // (bukan asumsi): 169.144 dari 182.277 domain multi.txt (93%)
+        // SUDAH tercakup ultimate.txt (superset tier HaGeZi: light < normal
+        // < pro < ultimate). Menyimpan keduanya sekaligus di RAM (proses
+        // VPN foreground service yang jalan 24/7) menambah ~180 ribu entri
+        // HashSet nyaris seluruhnya redundan setiap siklus update 24 jam —
+        // kontributor utama root cause laporan user "internet lambat saat
+        // nonton Reels" (lihat CHANGELOG-v2.md §Audit-10 untuk analisis
+        // lengkap). 12.712 domain unik di multi.txt yang TIDAK ada di
+        // ultimate.txt dikorbankan sebagai trade-off yang jauh lebih murah
+        // daripada menahan ~180 ribu entri redundan permanen di memori.
         Source("trackers", HAGEZI_ULTIMATE, "hagezi_ultimate"),
         Source("trackers", HAGEZI_NATIVE_XIAOMI, "hagezi_native_xiaomi"),
         // Default filter OFF (lihat FilterOption.kt) — user harus aktifkan manual.

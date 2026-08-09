@@ -100,19 +100,40 @@ class BlocklistUpdateManager(context: Context) {
     /**
      * Unduh & perbarui seluruh sumber blocklist dari internet (Fase 2.3).
      * Dipanggil dari `DnsEngineRepository.updateThreatDatabase()` (dipicu
-     * user lewat tombol "Perbarui Database" di UI) dan bisa dijadwalkan
-     * berkala (mis. WorkManager) di fase produksi selanjutnya.
+     * user lewat tombol "Perbarui Database" di UI) DAN dari
+     * `BlocklistUpdateWorker` (Audit-9) yang menjadwalkannya otomatis
+     * setiap 24 jam di background via WorkManager.
+     *
+     * @param enabledCategoryIds Audit-10: kategori (filter id) yang SEDANG
+     * aktif di [com.example.model.FilterOption]. Sumber yang kategorinya
+     * TIDAK ada di sini di-skip total (tidak diunduh, tidak diparsing,
+     * tidak disimpan) — sebelumnya SEMUA source di [BlocklistSource.ALL_SOURCES]
+     * diunduh & disimpan ke RAM tanpa syarat, termasuk kategori yang user
+     * matikan (mis. `doh_bypass_guard`, default OFF, 17 ribu domain
+     * tersimpan sia-sia 24/7). Kontributor bloat memori yang jadi salah
+     * satu root cause laporan "internet lambat saat nonton Reels" — lihat
+     * CHANGELOG-v2.md §Audit-10. `null` (default) = perilaku lama, unduh
+     * semua (dipakai test/pemanggilan tanpa akses ke filter state).
      */
-    suspend fun updateAll(): UpdateResult = withContext(Dispatchers.IO) {
+    suspend fun updateAll(enabledCategoryIds: Set<String>? = null): UpdateResult = withContext(Dispatchers.IO) {
         var updated = 0
         var unchanged = 0
         var failed = 0
 
         val byCategory = mutableMapOf<String, MutableSet<String>>()
+        val sourcesToFetch = if (enabledCategoryIds == null) {
+            BlocklistSource.ALL_SOURCES
+        } else {
+            BlocklistSource.ALL_SOURCES.filter { it.categoryId in enabledCategoryIds }
+        }
+        val skippedCount = BlocklistSource.ALL_SOURCES.size - sourcesToFetch.size
+        if (skippedCount > 0) {
+            Log.d(TAG, "Audit-10: $skippedCount sumber di-skip (kategori nonaktif) — hemat bandwidth & memori.")
+        }
 
         try {
             coroutineScope {
-                val deferreds = BlocklistSource.ALL_SOURCES.map { source ->
+                val deferreds = sourcesToFetch.map { source ->
                     async { source to fetchAndCacheSource(source) }
                 }
                 val results = deferreds.awaitAll()

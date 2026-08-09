@@ -185,6 +185,7 @@ object BlocklistEngine {
         "b-graph-fallback.facebook.com",
         "z-m-graph.facebook.com",
         "graph.instagram.com",
+        "graph-fallback.instagram.com",
         "gateway.instagram.com",
         "graph.whatsapp.com",
         "gateway.facebook.com",
