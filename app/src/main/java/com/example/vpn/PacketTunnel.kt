@@ -155,8 +155,8 @@ class PacketTunnel(
     private var icmpNotifySweeperJob: Job? = null
     private val identificationCounter = AtomicInteger(1)
 
-    private val udpNat = UdpNatManager(vpnService, tunnelScope) { data -> writeToTun(data) }
-    private val tcpNat = TcpNatManager(vpnService, tunnelScope) { data -> writeToTun(data) }
+    private val udpNat = UdpNatManager(vpnService, tunnelScope) { data -> writeToTunSuspend(data) }
+    private val tcpNat = TcpNatManager(vpnService, tunnelScope, { data -> writeToTun(data) }, { data -> writeToTunSuspend(data) })
 
     // Fase Audit-6: dedupe key untuk balasan ICMPv6 Port Unreachable (lihat
     // handlePacket cabang IPv6 UDP) — WAJIB, lihat dokumentasi bug kritis di
@@ -166,13 +166,44 @@ class PacketTunnel(
     private val ipv6UdpIcmpNotified = java.util.concurrent.ConcurrentHashMap<Ipv6UdpNotifyKey, Long>()
 
     @Volatile private var outputStream: FileOutputStream? = null
-    // Fase Audit-11 (lihat dokumentasi lengkap di header kelas): channel
-    // menggantikan `synchronized(writeLock)` lama. SATU coroutine
-    // (`tunWriterJob`) adalah SATU-SATUNYA yang pernah memanggil
-    // `outputStream.write()` secara langsung; semua sesi TCP/UDP/DNS lain
-    // cukup `trySend()` ke channel ini (operasi cepat, TIDAK memblokir
-    // thread OS) lalu lanjut kerja lain tanpa menunggu syscall write selesai.
-    private val tunOutboundChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
+    // [Fase Audit-12 - 2026-08-09] PERBAIKAN REGRESI KRITIS dari Audit-11.
+    // Audit-11 mengganti `synchronized(writeLock)` dengan
+    // `Channel.UNLIMITED` + `trySend()` untuk menghilangkan thread-blocking
+    // di packet loop. Itu BERHASIL menghapus kontensi lock, TAPI membuka
+    // bug baru yang lebih berbahaya: karena channel TIDAK PERNAH penuh dan
+    // `trySend()` TIDAK PERNAH menunggu, begitu laju produksi paket (mis.
+    // puluhan sesi TCP paralel saat scroll Reels/TikTok) melebihi laju
+    // nyata `outputStream.write()` ke tun device, paket menumpuk di RAM
+    // TANPA BATAS alih-alih memberi tekanan balik (backpressure) ke
+    // pengirimnya. Channel ini adalah titik keluar TUNGGAL untuk SELURUH
+    // trafik device (TCP+UDP+DNS semua app), jadi begitu satu burst video
+    // membuatnya membengkak, SEMUA trafik lain (browsing/download/game)
+    // ikut antre di belakangnya (head-of-line blocking) — persis
+    // menjelaskan laporan user: awalnya lancar, lalu SETELAH beberapa
+    // video (channel sempat menumpuk banyak), SEMUA jenis trafik (bukan
+    // cuma video) mendadak lambat/buffer, bahkan berpotensi OOM kalau
+    // dibiarkan cukup lama.
+    //
+    // Fix: channel dibatasi ([TUN_OUTBOUND_CHANNEL_CAPACITY]) sehingga
+    // memori TIDAK PERNAH bisa tumbuh tanpa batas — di bawah beban ekstrem,
+    // kelebihan paket di-drop dengan log peringatan (bukan menumpuk diam-
+    // diam), sama seperti pola yang SUDAH BENAR diterapkan di level sesi
+    // (`inboundChannel` UDP kapasitas 256, `TCP_INBOUND_CHANNEL_CAPACITY`
+    // 64 di TcpNatManager). Untuk jalur DATA TCP arah server->client
+    // (byte video/gambar/download sesungguhnya — paling sensitif terhadap
+    // kehilangan data, lihat dokumentasi Audit-4 di TcpNatManager.kt),
+    // ditambahkan [writeToTunSuspend] yang memakai `send()` suspend asli
+    // (backpressure sejati, tidak pernah drop) — dipanggil HANYA dari
+    // context suspend yang sudah ada (`tunWriterLoop` TCP & UDP), sehingga
+    // data video/download tidak pernah korup akibat drop di titik ini.
+    // Jalur kontrol (ACK/SYN-ACK/RST/FIN/ICMP/balasan DNS) tetap memakai
+    // [writeToTun] (trySend, boleh drop) karena secara alami sudah toleran
+    // kehilangan sesekali (retransmisi/timeout standar TCP/UDP/DNS) dan
+    // sebagian dipanggil dari context sinkron (mis. RST saat eviction sesi
+    // penuh di TcpNatManager.evictOldestIfFull()) yang tidak bisa `suspend`.
+    // Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Audit-12 untuk
+    // detail analisis & checklist verifikasi.
+    private val tunOutboundChannel = Channel<ByteArray>(capacity = TUN_OUTBOUND_CHANNEL_CAPACITY)
     private var tunWriterJob: Job? = null
 
     fun start(vpnInterface: ParcelFileDescriptor) {
@@ -256,25 +287,36 @@ class PacketTunnel(
     }
 
     /**
-     * Fase Audit-11: HANYA meng-enqueue ke [tunOutboundChannel] — TIDAK
-     * pernah menyentuh `outputStream.write()` langsung lagi, dan TIDAK
-     * pernah memblokir thread pemanggil. Signature (`(ByteArray) -> Unit`,
-     * bukan suspend) SENGAJA dipertahankan sama seperti sebelumnya, supaya
-     * seluruh pemanggil existing (TcpNatManager/UdpNatManager lambda
-     * constructor, semua call site sinkron di kelas ini sendiri) tidak
-     * perlu diubah sama sekali — mengurangi risiko regresi dibanding
-     * mengubah seluruh rantai pemanggil jadi suspend.
-     *
-     * `trySend` pada `Channel.UNLIMITED` pada praktiknya tidak pernah gagal
-     * (channel tidak pernah penuh, hanya bisa gagal kalau sudah ditutup —
-     * yaitu tepat setelah `stop()`, kondisi balapan yang wajar & aman untuk
-     * diabaikan dengan log peringatan).
+     * Jalur KONTROL (boleh drop): meng-enqueue ke [tunOutboundChannel] lewat
+     * `trySend()` — cepat, non-blocking, TIDAK PERNAH menunggu. Dipakai untuk
+     * paket yang secara alami toleran kehilangan sesekali (ACK/SYN-ACK/RST/
+     * FIN/ICMP/balasan DNS — semua punya mekanisme retry/timeout standar di
+     * level protokol), dan untuk call site yang memang sinkron (bukan
+     * suspend context), mis. RST saat `evictOldestIfFull()` di
+     * TcpNatManager. Sejak [Fase Audit-12], channel ini BERKAPASITAS
+     * TERBATAS ([TUN_OUTBOUND_CHANNEL_CAPACITY]) — saat penuh, paket
+     * di-drop dengan log peringatan alih-alih menumpuk tanpa batas di RAM
+     * (lihat dokumentasi lengkap di deklarasi [tunOutboundChannel]).
      */
     private fun writeToTun(data: ByteArray) {
         val result = tunOutboundChannel.trySend(data)
         if (result.isFailure) {
-            Log.w(TAG, "Gagal enqueue paket balasan ke tun (channel tertutup/tunnel berhenti): ${result.exceptionOrNull()?.message}")
+            Log.w(TAG, "tunOutboundChannel penuh, satu paket kontrol di-drop (bukan menumpuk tanpa batas): ${result.exceptionOrNull()?.message}")
         }
+    }
+
+    /**
+     * Jalur DATA (TIDAK boleh drop): `send()` suspend asli ke
+     * [tunOutboundChannel] — memberi backpressure sejati. Saat channel
+     * penuh, pemanggil (satu-satunya: `tunWriterLoop` TCP/UDP, sudah dalam
+     * suspend context) akan menunggu sejenak alih-alih paket hilang diam-
+     * diam — persis pola yang sudah benar diterapkan di
+     * `TcpNatManager.Session.inboundChannel` (kapasitas 64, `send()`
+     * suspend) untuk mencegah korupsi stream video/download. Lihat
+     * dokumentasi [Fase Audit-12] di deklarasi [tunOutboundChannel].
+     */
+    private suspend fun writeToTunSuspend(data: ByteArray) {
+        tunOutboundChannel.send(data)
     }
 
     private suspend fun handlePacket(buffer: ByteArray, length: Int) {
@@ -625,6 +667,14 @@ class PacketTunnel(
         private const val TAG = "PacketTunnel"
         const val DNS_PORT = 53
         const val MTU_BUFFER_SIZE = 1500
+        // [Fase Audit-12]: batas kapasitas tunOutboundChannel — lihat
+        // dokumentasi lengkap di deklarasi `tunOutboundChannel` di atas.
+        // 4096 slot x ~1500 byte (MTU) maks ~6MB buffer terburuk, jauh
+        // lebih aman daripada UNLIMITED (bisa ratusan MB-GB dalam
+        // hitungan detik saat streaming berat), tapi tetap cukup besar
+        // untuk menyerap burst wajar (mis. beberapa sesi TCP video paralel)
+        // tanpa membuang paket di kondisi pemakaian normal.
+        const val TUN_OUTBOUND_CHANNEL_CAPACITY = 4096
         const val UPSTREAM_TIMEOUT_MS = 2500
         // Fase Audit-6: jeda minimum antar balasan ICMPv6 Port Unreachable
         // untuk kombinasi (srcPort, dstIp, dstPort) UDP-over-IPv6 yang sama —

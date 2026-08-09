@@ -84,7 +84,8 @@ import java.util.concurrent.atomic.AtomicInteger
 class TcpNatManager(
     private val vpnService: VpnService,
     private val scope: CoroutineScope,
-    private val writeToTun: (ByteArray) -> Unit
+    private val writeToTun: (ByteArray) -> Unit,
+    private val writeToTunSuspend: suspend (ByteArray) -> Unit
 ) {
     private data class SessionKey(val srcPort: Int, val dstIp: String, val dstPort: Int)
 
@@ -457,7 +458,7 @@ class TcpNatManager(
         }
     }
 
-    private fun sendDataSegment(session: Session, key: SessionKey, payload: ByteArray) {
+    private suspend fun sendDataSegment(session: Session, key: SessionKey, payload: ByteArray) {
         val packet = NetPacketUtils.buildIpv4TcpPacket(
             srcIp = session.remoteIp,
             srcPort = session.remotePort,
@@ -470,7 +471,16 @@ class TcpNatManager(
             payload = payload,
             identification = identification.getAndIncrement()
         )
-        writeToTun(packet)
+        // [Fase Audit-12] SENGAJA pakai writeToTunSuspend (send() suspend,
+        // backpressure sejati), BUKAN writeToTun (trySend, boleh drop).
+        // Ini jalur DATA byte video/gambar/download sesungguhnya — men-drop
+        // satu segmen di sini akan merusak stream TCP secara permanen
+        // (bukan hilang sementara yang bisa diretransmisi), persis alasan
+        // yang sama kenapa readLoop() memakai inboundChannel.send() suspend
+        // (lihat dokumentasi Audit-4 di atas). Aman dipanggil di sini
+        // karena satu-satunya pemanggil, tunWriterLoop, sudah suspend
+        // context.
+        writeToTunSuspend(packet)
         session.serverSeq = (session.serverSeq + payload.size) and 0xFFFFFFFFL
     }
 

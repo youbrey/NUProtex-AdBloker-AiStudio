@@ -61,7 +61,12 @@ import java.util.concurrent.atomic.AtomicInteger
 class UdpNatManager(
     private val vpnService: VpnService,
     private val scope: CoroutineScope,
-    private val writeToTun: (ByteArray) -> Unit
+    // [Fase Audit-12] UDP tidak punya jalur "kontrol terpisah" seperti TCP
+    // (ACK/SYN-ACK/RST) — satu-satunya arah balik (server->client) SELALU
+    // berupa payload data, jadi hanya butuh writeToTunSuspend (backpressure
+    // sejati). Parameter writeToTun (trySend, boleh drop) yang lama sudah
+    // tidak dipakai di kelas ini & dihapus untuk kejelasan.
+    private val writeToTunSuspend: suspend (ByteArray) -> Unit
 ) {
     private data class SessionKey(val srcPort: Int, val dstIp: String, val dstPort: Int)
 
@@ -253,7 +258,14 @@ class UdpNatManager(
                     payload = payload,
                     identification = identification.getAndIncrement()
                 )
-                writeToTun(reply)
+                // [Fase Audit-12] Pakai writeToTunSuspend (send() suspend) —
+                // aman di sini karena tunWriterLoop sudah suspend context,
+                // dan memberi backpressure sejati ke tunOutboundChannel
+                // bersama alih-alih drop diam-diam saat tun sedang penuh.
+                // UDP tetap toleran keterlambatan/drop di titik SEBELUM ini
+                // (session.inboundChannel kapasitas 256, lihat readLoop),
+                // jadi tidak ada regresi perilaku — hanya lebih tertib.
+                writeToTunSuspend(reply)
             }
         } catch (e: Exception) {
             Log.d(TAG, "UDP tunWriterLoop berhenti: ${e.message}")
