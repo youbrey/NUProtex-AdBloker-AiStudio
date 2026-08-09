@@ -456,7 +456,9 @@ class DnsEngineRepository(private val context: Context) {
     fun updateThreatDatabase() {
         scope.launch {
             _isUpdatingDb.value = true
-            val result = blocklistUpdateManager.updateAll()
+            // Audit-10: hanya unduh sumber untuk kategori yang sedang aktif.
+            val enabledIds = _filterOptions.value.filter { it.isEnabled }.map { it.id }.toSet()
+            val result = blocklistUpdateManager.updateAll(enabledIds)
             if (result.success) {
                 refreshRuleCountsFromStore()
                 _stats.value = _stats.value.copy(
