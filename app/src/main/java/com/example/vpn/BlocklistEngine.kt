@@ -197,7 +197,28 @@ object BlocklistEngine {
         "api16-normal-c-useast1a.tiktokv.com",
         // Anthropic/Claude — API inti aplikasi Claude.
         "api.anthropic.com",
-        "claude.ai"
+        "claude.ai",
+        // Audit-13: CDN media APEX (bukan cuma satu hostname spesifik) —
+        // "scontent.xx.fbcdn.net" di atas HANYA cocok persis hostname itu +
+        // subdomain-nya sendiri, TIDAK cocok edge server regional sungguhan
+        // seperti "scontent-sin6-1.xx.fbcdn.net" atau "scontent-nrt1-2.xx.fbcdn.net"
+        // (itu SIBLING, bukan child dari "scontent.xx.fbcdn.net"). Facebook/
+        // Instagram/WhatsApp memilih edge server berbeda per region/request,
+        // jadi allowlist per-hostname spesifik TIDAK CUKUP — kalau ada sumber
+        // blocklist manapun yang kebetulan memuat pola serupa, gambar/video
+        // dari edge region tertentu bisa gagal dimuat sebagian (persis gejala
+        // "feed/reels lambat/putus-putus", bukan gagal total, karena hanya
+        // sebagian edge server yang kena). Ditambahkan APEX domain CDN media
+        // (bukan tracker) supaya SEMUA edge server ikut ter-cover otomatis:
+        "fbcdn.net",
+        "cdninstagram.com",
+        // WhatsApp media & call infra (kirim/terima foto/video/panggilan) —
+        // beda dari "graph.whatsapp.com" (API) di atas.
+        "whatsapp.net",
+        // TikTok CDN media (video/gambar), beda dari "api.tiktokv.com" (API).
+        "tiktokcdn.com",
+        "tiktokcdn-us.com",
+        "ibyteimg.com"
     )
 
     /** true jika [normalized] persis salah satu domain esensial, atau subdomain darinya. */

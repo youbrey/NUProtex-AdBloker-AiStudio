@@ -180,7 +180,33 @@ object BlocklistSource {
         // lengkap). 12.712 domain unik di multi.txt yang TIDAK ada di
         // ultimate.txt dikorbankan sebagai trade-off yang jauh lebih murah
         // daripada menahan ~180 ribu entri redundan permanen di memori.
-        Source("trackers", HAGEZI_ULTIMATE, "hagezi_ultimate"),
+        //
+        // Audit-13 (BUG KRITIS, DIHAPUS TOTAL): "ultimate.txt" ternyata BUKAN
+        // sekadar "lebih komprehensif" seperti diasumsikan Audit-8/10 — README
+        // resmi HaGeZi (github.com/hagezi/dns-blocklists#ultimate,
+        // dikonfirmasi user via screenshot 2026-08-09) MENDOKUMENTASIKAN SECARA
+        // EKSPLISIT bahwa list ini memblokir META trackers sampai TINGKAT YANG
+        // MERUSAK FUNGSI: "restricts the use of Facebook and Facebook Messenger
+        // apps... Whatsapp graph trackers are blocked, which leads to
+        // restrictions when creating avatars, using the in-app helpcenter and
+        // using video effects" — plus Microsoft/Xbox (Windows Spotlight, XBox
+        // Live Achievements). README-nya SENDIRI memperingatkan: "should only
+        // be used by experienced users... an admin should be available to
+        // unblock incorrectly blocked domains". Ini PERSIS kelas risiko yang
+        // sudah diantisipasi & sengaja DIHINDARI untuk "social.txt" (lihat
+        // komentar HAGEZI_ANTI_PIRACY dkk. di atas) — tapi lolos untuk
+        // "ultimate.txt" karena diasumsikan hanya soal ukuran/redundansi, bukan
+        // soal breakage fungsional. ESSENTIAL_ALLOWLIST di BlocklistEngine
+        // hanya menutup celah untuk endpoint API inti (graph.*.com dkk) yang
+        // SUDAH diketahui/diduga sebelumnya — TIDAK ada jaminan menutup semua
+        // domain "graph trackers"/avatar/video-effect yang dimaksud README
+        // (daftar persis domainnya tidak dipublikasikan HaGeZi). Satu-satunya
+        // cara aman: JANGAN gunakan tier "ultimate" (aggressive) sama sekali
+        // untuk kategori yang enabled-by-default. `hagezi_pro` (tier di bawah
+        // ultimate, TIDAK punya peringatan breakage yang sama di README resmi)
+        // tetap dipakai (lihat "trackers"/"game_ads"/"marketplace_ads" di atas)
+        // sebagai pengganti yang jauh lebih aman.
+        // Source("trackers", HAGEZI_ULTIMATE, "hagezi_ultimate"), // DIHAPUS Audit-13 — lihat penjelasan di atas.
         Source("trackers", HAGEZI_NATIVE_XIAOMI, "hagezi_native_xiaomi"),
         // Default filter OFF (lihat FilterOption.kt) — user harus aktifkan manual.
         Source("doh_bypass_guard", HAGEZI_DOH_VPN_PROXY_BYPASS, "hagezi_doh_vpn_proxy_bypass")

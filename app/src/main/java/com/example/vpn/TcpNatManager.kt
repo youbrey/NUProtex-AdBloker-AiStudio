@@ -560,7 +560,7 @@ class TcpNatManager(
         private const val IDLE_ESTABLISHED_TIMEOUT_MS = 120_000L // 2 menit
         private const val IDLE_TRANSIENT_TIMEOUT_MS = 15_000L // 15 detik
         private const val TIME_WAIT_LINGER_MS = 2_000L
-        private const val MAX_SESSIONS = 500
+        private const val MAX_SESSIONS = 150
         // Fase Audit-2: shift Window Scale yang KITA tawarkan ke klien (nilai
         // umum dipakai OS modern, mis. Linux/Android sering pakai 6-9). Window
         // asli yang bisa diiklankan = ADVERTISED_WINDOW_BYTES (di-shift kanan

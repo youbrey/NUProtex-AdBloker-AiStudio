@@ -293,7 +293,21 @@ class UdpNatManager(
         private const val TAG = "UdpNatManager"
         private const val SESSION_IDLE_TIMEOUT_MS = 30_000
         private const val SWEEPER_INTERVAL_MS = 15_000L
-        private const val MAX_SESSIONS = 500
+        // Audit-13: diturunkan dari 500. Setiap sesi (TCP di sini + UDP di
+        // UdpNatManager) kini punya 3 coroutine blocking-IO permanen
+        // (readerJob+writerJob+tunWriterJob, lihat Audit-4) yang masing-masing
+        // menahan satu thread OS sungguhan (Dispatchers.IO membuat thread baru
+        // untuk kerja blocking yang tidak bisa dijadwalkan ulang). Skenario
+        // terburuk lama: 500 TCP + 500 UDP x 3 = 3000 thread blocked
+        // bersamaan — menghabiskan ratusan MB-GB stack memory & membebani
+        // scheduler kernel di perangkat mobile, PERSIS pola "baru terasa
+        // lambat setelah pemakaian berat berkelanjutan" (session churn dari
+        // scroll reels berulang kali menumpuk sesi lebih cepat dari sesi lama
+        // yang di-cleanup sweeper 15-120 detik) yang dilaporkan user. 150
+        // masih jauh lebih dari cukup untuk penggunaan wajar (browser modern
+        // sendiri biasanya <100 koneksi aktif bersamaan berkat multiplexing
+        // HTTP/2), sambil membatasi skenario terburuk ke 150x3x2=900 thread.
+        private const val MAX_SESSIONS = 150
         // Fase Audit-3: buffer kernel socket UDP diperbesar dari default OS
         // (seringkali cuma puluhan-ratusan KB) ke ~1MB — bantalan tambahan
         // saat readLoop/tunWriterLoop sesaat sibuk, mengurangi risiko drop
