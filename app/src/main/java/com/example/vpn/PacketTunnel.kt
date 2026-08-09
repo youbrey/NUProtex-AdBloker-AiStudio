@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -99,6 +100,39 @@ import java.util.concurrent.atomic.AtomicInteger
  *    lanjutan, bukan prioritas karena dampak nyata dari fix gagal-cepat
  *    ini sudah menyelesaikan gejala performa yang dilaporkan.
  *  Lihat CHANGELOG.md §Audit-5 untuk detail & status verifikasi.
+ * [Audit-11 - 2026-08-09] **BUG KRITIS ditemukan lewat verifikasi device
+ * fisik nyata**: user melaporkan build Audit-10 (fix redundansi memori
+ * blocklist) MASIH sangat lambat/buffering saat nonton video media sosial.
+ * Audit-10 tidak menyentuh sama sekali kandidat yang sudah diflag terbuka
+ * sejak Audit-4 (lihat "Keterbatasan/Kandidat Audit Berikutnya" di
+ * TcpNatManager.kt): satu `synchronized(writeLock)` di [writeToTun] yang
+ * dipakai BERSAMA oleh SEMUA sesi TCP+UDP+DNS sekaligus.
+ *  - Root cause: `synchronized` di Kotlin memblokir THREAD OS ASLI, bukan
+ *    cuma coroutine-nya. Saat scroll Reels/TikTok, puluhan sesi TCP paralel
+ *    (tiap sesi punya `tunWriterLoop` sendiri di `Dispatchers.IO`) berebut
+ *    lock yang sama. Kalau satu `outputStream.write()` sempat lambat
+ *    (buffer kernel tun penuh — wajar di beban tinggi), SEMUA thread lain
+ *    yang antre lock itu ikut terblokir, termasuk berpotensi menghabiskan
+ *    thread pool `Dispatchers.IO` yang dipakai bersama SELURUH app
+ *    (termasuk `BlocklistUpdateManager`). Ini match persis dengan gejala
+ *    yang dilaporkan user: lambat spesifik saat banyak koneksi paralel
+ *    (video sosial), bukan aktivitas ringan seperti baca teks.
+ *  - Fix: `writeLock`/`synchronized` DIHAPUS TOTAL. Diganti
+ *    `tunOutboundChannel` (Channel.UNLIMITED) + SATU coroutine
+ *    `tunWriterJob` yang jadi satu-satunya pemanggil `outputStream.write()`.
+ *    Semua pemanggil `writeToTun()` (TcpNatManager/UdpNatManager/DNS reply)
+ *    sekarang cukup `trySend()` — operasi cepat non-blocking, TIDAK PERNAH
+ *    menunggu syscall write selesai. Signature `writeToTun` SENGAJA
+ *    dipertahankan sama (bukan suspend) supaya nol perubahan di pemanggil
+ *    manapun — meminimalkan risiko regresi.
+ *  - INI BUKAN JAMINAN menyelesaikan 100% masalah buffering — ini kandidat
+ *    root cause paling kuat berdasarkan bukti kode (lock blocking thread
+ *    pool bersama) + gejala device fisik yang cocok, tapi WAJIB diverifikasi
+ *    ulang. Jika masih lambat setelah ini, kandidat berikutnya: throughput
+ *    fundamental `ParcelFileDescriptor`/tun device Android sendiri (di luar
+ *    kendali kode aplikasi) — lihat catatan Audit-4.
+ *  Lihat CHANGELOG.md & RENCANA_PRODUKSI_NETSHIELD.md §Audit-11 untuk
+ *  detail & checklist verifikasi lengkap.
  */
 class PacketTunnel(
     private val vpnService: VpnService,
@@ -132,7 +166,14 @@ class PacketTunnel(
     private val ipv6UdpIcmpNotified = java.util.concurrent.ConcurrentHashMap<Ipv6UdpNotifyKey, Long>()
 
     @Volatile private var outputStream: FileOutputStream? = null
-    private val writeLock = Any()
+    // Fase Audit-11 (lihat dokumentasi lengkap di header kelas): channel
+    // menggantikan `synchronized(writeLock)` lama. SATU coroutine
+    // (`tunWriterJob`) adalah SATU-SATUNYA yang pernah memanggil
+    // `outputStream.write()` secara langsung; semua sesi TCP/UDP/DNS lain
+    // cukup `trySend()` ke channel ini (operasi cepat, TIDAK memblokir
+    // thread OS) lalu lanjut kerja lain tanpa menunggu syscall write selesai.
+    private val tunOutboundChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
+    private var tunWriterJob: Job? = null
 
     fun start(vpnInterface: ParcelFileDescriptor) {
         stop() // jaga-jaga tidak ada loop ganda
@@ -140,6 +181,22 @@ class PacketTunnel(
         val input = FileInputStream(vpnInterface.fileDescriptor)
         val output = FileOutputStream(vpnInterface.fileDescriptor)
         outputStream = output
+
+        // Fase Audit-11: satu-satunya coroutine yang benar-benar melakukan
+        // syscall write() ke tun, menguras tunOutboundChannel secara
+        // berurutan. Karena hanya SATU coroutine yang pernah menyentuh
+        // outputStream, tidak ada lagi kebutuhan `synchronized` sama sekali
+        // — dan yang lebih penting, tidak ada thread lain yang pernah
+        // terblokir menunggu syscall write selesai.
+        tunWriterJob = tunnelScope.launch(Dispatchers.IO) {
+            for (data in tunOutboundChannel) {
+                try {
+                    outputStream?.write(data)
+                } catch (e: IOException) {
+                    Log.w(TAG, "Gagal menulis balik ke tun (mungkin sudah ditutup): ${e.message}")
+                }
+            }
+        }
 
         // Fase Audit-6: bersihkan entri dedupe ICMPv6 kadaluarsa secara
         // berkala — lihat dokumentasi `ipv6UdpIcmpNotified` & konstanta
@@ -184,6 +241,8 @@ class PacketTunnel(
         packetLoopJob = null
         icmpNotifySweeperJob?.cancel()
         icmpNotifySweeperJob = null
+        tunWriterJob?.cancel()
+        tunWriterJob = null
         ipv6UdpIcmpNotified.clear()
         udpNat.closeAll()
         tcpNat.closeAll()
@@ -196,13 +255,25 @@ class PacketTunnel(
         tunnelScope.cancel()
     }
 
+    /**
+     * Fase Audit-11: HANYA meng-enqueue ke [tunOutboundChannel] — TIDAK
+     * pernah menyentuh `outputStream.write()` langsung lagi, dan TIDAK
+     * pernah memblokir thread pemanggil. Signature (`(ByteArray) -> Unit`,
+     * bukan suspend) SENGAJA dipertahankan sama seperti sebelumnya, supaya
+     * seluruh pemanggil existing (TcpNatManager/UdpNatManager lambda
+     * constructor, semua call site sinkron di kelas ini sendiri) tidak
+     * perlu diubah sama sekali — mengurangi risiko regresi dibanding
+     * mengubah seluruh rantai pemanggil jadi suspend.
+     *
+     * `trySend` pada `Channel.UNLIMITED` pada praktiknya tidak pernah gagal
+     * (channel tidak pernah penuh, hanya bisa gagal kalau sudah ditutup —
+     * yaitu tepat setelah `stop()`, kondisi balapan yang wajar & aman untuk
+     * diabaikan dengan log peringatan).
+     */
     private fun writeToTun(data: ByteArray) {
-        synchronized(writeLock) {
-            try {
-                outputStream?.write(data)
-            } catch (e: IOException) {
-                Log.w(TAG, "Gagal menulis balik ke tun (mungkin sudah ditutup): ${e.message}")
-            }
+        val result = tunOutboundChannel.trySend(data)
+        if (result.isFailure) {
+            Log.w(TAG, "Gagal enqueue paket balasan ke tun (channel tertutup/tunnel berhenti): ${result.exceptionOrNull()?.message}")
         }
     }
 
