@@ -157,6 +157,11 @@ class PacketTunnel(
 
     private val udpNat = UdpNatManager(vpnService, tunnelScope) { data -> writeToTunSuspend(data) }
     private val tcpNat = TcpNatManager(vpnService, tunnelScope, { data -> writeToTun(data) }, { data -> writeToTunSuspend(data) })
+    // Fase Audit-14: relay ICMP (ping) — sebelumnya di-drop total (lihat
+    // dokumentasi kelas IcmpRelay), menyebabkan tool diagnostik game & cek
+    // stabilitas jaringan berbasis ping SELALU gagal sejak routing catch-all
+    // (Fase 6.10) mulai menangkap ICMP juga.
+    private val icmpRelay = IcmpRelay(vpnService, tunnelScope) { data -> writeToTun(data) }
 
     // Fase Audit-6: dedupe key untuk balasan ICMPv6 Port Unreachable (lihat
     // handlePacket cabang IPv6 UDP) — WAJIB, lihat dokumentasi bug kritis di
@@ -341,7 +346,11 @@ class PacketTunnel(
                     tcpNat.onOutboundPacket(packet, ipv4, tcp)
                 }
                 else -> {
-                    // ICMP/protokol lain
+                    // Fase Audit-14: ICMP (ping) sekarang direlay (lihat IcmpRelay) alih-alih
+                    // di-drop diam-diam. Protokol lain selain ICMP masih diabaikan dengan aman.
+                    if (ipv4.protocol == IcmpRelay.PROTOCOL_ICMP) {
+                        icmpRelay.onOutboundPacket(packet, ipv4)
+                    }
                 }
             }
             return
